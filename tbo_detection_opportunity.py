@@ -1,10 +1,11 @@
 from pathlib import Path
 from typing import Iterable, Optional
+import time
 
 import numpy as np
 import pandas as pd
 
-###
+
 # ============================================================
 # Basic utilities
 # ============================================================
@@ -19,11 +20,7 @@ def infer_population_from_object_id(object_id: str) -> str:
     Everything else is treated as real.
     """
     object_id = normalize_object_id(object_id)
-
-    if object_id.upper().startswith("NESC"):
-        return "synthetic"
-
-    return "real"
+    return "synthetic" if object_id.upper().startswith("NESC") else "real"
 
 
 def scalar_statistics(values: pd.Series, prefix: str) -> dict:
@@ -56,8 +53,27 @@ def scalar_statistics(values: pd.Series, prefix: str) -> dict:
     }
 
 
+def read_space_separated_csv(path: Path, **kwargs) -> pd.DataFrame:
+    """
+    Read files written with pandas sep=' '.
+
+    If your files were written with:
+        df.to_csv(path, sep=' ', index=False)
+
+    then column names containing spaces, such as "Object id" and "Julian Date",
+    should usually be quoted automatically and readable with this function.
+    """
+    return pd.read_csv(
+        path,
+        sep=" ",
+        engine="python",
+        skipinitialspace=True,
+        **kwargs,
+    )
+
+
 # ============================================================
-# Loading
+# Master file
 # ============================================================
 
 def load_master_file(
@@ -67,16 +83,19 @@ def load_master_file(
     diameter_col: str,
 ) -> pd.DataFrame:
     """
-    Load the master file containing object-level H and D.
+    Load master file containing object-level H and D.
     """
 
-    master = pd.read_csv(master_csv)
+    master = read_space_separated_csv(master_csv)
 
     required_cols = [object_id_col, h_col, diameter_col]
     missing = [c for c in required_cols if c not in master.columns]
 
     if missing:
-        raise ValueError(f"Master file is missing required columns: {missing}")
+        raise ValueError(
+            f"Master file is missing columns {missing}.\n"
+            f"Columns found were:\n{list(master.columns)}"
+        )
 
     master = master[required_cols].copy()
 
@@ -86,133 +105,74 @@ def load_master_file(
 
     master["population"] = master[object_id_col].apply(infer_population_from_object_id)
 
-    # If duplicate objects exist, keep the first.
+    master = master.dropna(subset=[object_id_col, h_col, diameter_col])
     master = master.drop_duplicates(subset=[object_id_col], keep="first")
 
     return master
 
 
-def load_trajectory_folder(
-    trajectory_folder: Path,
-    master: pd.DataFrame,
-    object_id_col: str,
+# ============================================================
+# Window generation
+# ============================================================
+
+def find_global_epoch_range(
+    trajectory_files: list[Path],
     epoch_col: str,
-    distance_col: str,
-    h_col: str,
-    diameter_col: str,
-    file_glob: str = "*.csv",
-) -> pd.DataFrame:
+    chunksize: int,
+    progress_every: int = 250,
+) -> tuple[float, float]:
     """
-    Load one trajectory CSV per object and merge H, D, and population from master.
-
-    If an individual trajectory CSV does not contain Object id, the file name stem
-    is used as the object ID.
+    Lightweight pass through the files to find global min/max epoch.
+    Only reads the epoch column.
     """
 
-    trajectory_folder = Path(trajectory_folder)
-    files = sorted(trajectory_folder.glob(file_glob))
+    global_min = np.inf
+    global_max = -np.inf
 
-    if len(files) == 0:
-        raise FileNotFoundError(
-            f"No trajectory files matching '{file_glob}' found in {trajectory_folder}"
-        )
+    start_time_wall = time.time()
+    n_files_total = len(trajectory_files)
 
-    dfs = []
+    print("Scanning trajectory files to determine global epoch range...")
 
-    for file in files:
+    for i, file in enumerate(trajectory_files, start=1):
         try:
-            df_i = pd.read_csv(file)
-        except Exception as e:
-            print(f"Skipping {file.name}: could not read CSV. Error: {e}")
-            continue
-
-        if object_id_col not in df_i.columns:
-            df_i[object_id_col] = file.stem
-
-        required_traj_cols = [object_id_col, epoch_col, distance_col]
-        missing = [c for c in required_traj_cols if c not in df_i.columns]
-
-        if missing:
-            print(f"Skipping {file.name}: missing trajectory columns {missing}")
-            continue
-
-        df_i[object_id_col] = df_i[object_id_col].apply(normalize_object_id)
-
-        df_i = df_i.merge(
-            master[[object_id_col, h_col, diameter_col, "population"]],
-            on=object_id_col,
-            how="left",
-            validate="many_to_one",
-        )
-
-        missing_master = df_i[df_i[h_col].isna() | df_i[diameter_col].isna()]
-        if len(missing_master) > 0:
-            missing_ids = missing_master[object_id_col].drop_duplicates().tolist()
-            print(
-                f"Warning: {file.name} has object ID(s) missing H or D in master: "
-                f"{missing_ids[:5]}"
+            reader = read_space_separated_csv(
+                file,
+                usecols=[epoch_col],
+                chunksize=chunksize,
             )
 
-        dfs.append(df_i)
+            for chunk in reader:
+                epochs = pd.to_numeric(chunk[epoch_col], errors="coerce").dropna()
 
-    if len(dfs) == 0:
-        raise RuntimeError("No valid trajectory CSV files were loaded.")
+                if len(epochs) == 0:
+                    continue
 
-    df = pd.concat(dfs, ignore_index=True)
+                global_min = min(global_min, epochs.min())
+                global_max = max(global_max, epochs.max())
 
-    df[epoch_col] = pd.to_numeric(df[epoch_col], errors="coerce")
-    df[distance_col] = pd.to_numeric(df[distance_col], errors="coerce")
-    df[h_col] = pd.to_numeric(df[h_col], errors="coerce")
-    df[diameter_col] = pd.to_numeric(df[diameter_col], errors="coerce")
+        except Exception as e:
+            print(f"Warning: could not scan epochs in {file.name}. Error: {e}")
 
-    df = df.dropna(
-        subset=[
-            object_id_col,
-            epoch_col,
-            distance_col,
-            h_col,
-            diameter_col,
-        ]
-    )
+        if i == 1 or i == n_files_total or i % progress_every == 0:
+            elapsed = time.time() - start_time_wall
+            percent_done = 100.0 * i / n_files_total
+            files_per_sec = i / elapsed if elapsed > 0 else np.nan
+            remaining_files = n_files_total - i
+            eta_sec = remaining_files / files_per_sec if files_per_sec > 0 else np.nan
 
-    return df
+            print(
+                f"[epoch scan {i:,}/{n_files_total:,}] "
+                f"{percent_done:6.2f}% complete | "
+                f"elapsed: {elapsed / 60:.1f} min | "
+                f"ETA: {eta_sec / 60:.1f} min"
+            )
 
+    if not np.isfinite(global_min) or not np.isfinite(global_max):
+        raise RuntimeError("Could not determine global epoch range from trajectory files.")
 
-# ============================================================
-# Population filtering
-# ============================================================
+    return float(global_min), float(global_max)
 
-def filter_population(
-    df: pd.DataFrame,
-    population_mode: str,
-) -> pd.DataFrame:
-    """
-    population_mode options:
-        "synthetic" -> Object id starts with NESC
-        "real"      -> Object id does not start with NESC
-        "both"      -> all objects
-    """
-
-    population_mode = population_mode.lower().strip()
-
-    if population_mode == "both":
-        return df.copy()
-
-    if population_mode == "synthetic":
-        return df[df["population"] == "synthetic"].copy()
-
-    if population_mode == "real":
-        return df[df["population"] == "real"].copy()
-
-    raise ValueError(
-        f"Invalid population_mode='{population_mode}'. "
-        "Use 'synthetic', 'real', or 'both'."
-    )
-
-
-# ============================================================
-# Windowing
-# ============================================================
 
 def generate_window_starts(
     start_epoch: float,
@@ -246,44 +206,353 @@ def generate_window_starts(
     return np.array(starts, dtype=float)
 
 
-def summarize_window_membership(
-    df_window: pd.DataFrame,
+def make_window_grid(
+    population_modes: Iterable[str],
+    window_lengths_days: Iterable[float],
+    window_step_days: float,
+    start_epoch: float,
+    end_epoch: float,
+    distance_min: float,
+    distance_max: float,
+    include_partial_windows: bool,
+) -> pd.DataFrame:
+    """
+    Make a complete grid of all requested windows.
+
+    This lets the final window_summary.csv include zero-count windows too.
+    """
+
+    rows = []
+
+    for population_mode in population_modes:
+        for window_length_days in window_lengths_days:
+            starts = generate_window_starts(
+                start_epoch=start_epoch,
+                end_epoch=end_epoch,
+                window_length_days=window_length_days,
+                window_step_days=window_step_days,
+                include_partial_windows=include_partial_windows,
+            )
+
+            for window_start in starts:
+                rows.append(
+                    {
+                        "population_mode": population_mode,
+                        "window_length_days": float(window_length_days),
+                        "window_step_days": float(window_step_days),
+                        "window_start": float(window_start),
+                        "window_end": float(window_start + window_length_days),
+                        "distance_min": float(distance_min),
+                        "distance_max": float(distance_max),
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# Streaming trajectory processing
+# ============================================================
+
+def get_file_columns(file: Path) -> list[str]:
+    """
+    Read only the header to get column names.
+    """
+    header = read_space_separated_csv(file, nrows=0)
+    return list(header.columns)
+
+
+def process_one_trajectory_file(
+    file: Path,
+    master_lookup: dict,
     object_id_col: str,
     epoch_col: str,
     distance_col: str,
     h_col: str,
     diameter_col: str,
+    distance_min: float,
+    distance_max: float,
+    population_modes: Iterable[str],
+    window_starts_by_length: dict[float, np.ndarray],
+    window_step_days: float,
+    min_duration_days: float,
+    chunksize: int,
+) -> list[dict]:
+    """
+    Process one trajectory file and return compact membership rows.
+
+    Only qualifying epochs inside the distance range are retained.
+    """
+
+    try:
+        columns = get_file_columns(file)
+    except Exception as e:
+        print(f"Skipping {file.name}: could not read header. Error: {e}")
+        return []
+
+    has_object_id_col = object_id_col in columns
+
+    usecols = [epoch_col, distance_col]
+
+    if has_object_id_col:
+        usecols.append(object_id_col)
+
+    missing = [c for c in [epoch_col, distance_col] if c not in columns]
+
+    if missing:
+        print(
+            f"Skipping {file.name}: missing columns {missing}. "
+            f"Columns found were: {columns}"
+        )
+        return []
+
+    qualifying_chunks = []
+
+    try:
+        reader = read_space_separated_csv(
+            file,
+            usecols=usecols,
+            chunksize=chunksize,
+        )
+
+        for chunk in reader:
+            if has_object_id_col:
+                chunk[object_id_col] = chunk[object_id_col].apply(normalize_object_id)
+            else:
+                chunk[object_id_col] = file.stem
+
+            chunk[epoch_col] = pd.to_numeric(chunk[epoch_col], errors="coerce")
+            chunk[distance_col] = pd.to_numeric(chunk[distance_col], errors="coerce")
+
+            chunk = chunk.dropna(subset=[object_id_col, epoch_col, distance_col])
+
+            chunk = chunk[
+                (chunk[distance_col] >= distance_min)
+                & (chunk[distance_col] <= distance_max)
+            ]
+
+            if len(chunk) > 0:
+                qualifying_chunks.append(
+                    chunk[[object_id_col, epoch_col, distance_col]]
+                )
+
+    except Exception as e:
+        print(f"Skipping {file.name}: could not process. Error: {e}")
+        return []
+
+    if len(qualifying_chunks) == 0:
+        return []
+
+    # This is usually small because it only includes distance-qualified epochs.
+    dfq = pd.concat(qualifying_chunks, ignore_index=True)
+
+    membership_rows = []
+
+    # Normally one file = one object, but this handles accidental multi-object files.
+    for object_id, df_obj in dfq.groupby(object_id_col, dropna=False):
+        object_id = normalize_object_id(object_id)
+
+        if object_id not in master_lookup:
+            print(f"Warning: {file.name}: object ID '{object_id}' not found in master.")
+            continue
+
+        H = master_lookup[object_id][h_col]
+        D = master_lookup[object_id][diameter_col]
+        population = master_lookup[object_id]["population"]
+
+        df_obj = df_obj.sort_values(epoch_col)
+
+        epochs = df_obj[epoch_col].to_numpy(dtype=float)
+        distances = df_obj[distance_col].to_numpy(dtype=float)
+
+        object_population_modes = ["both", population]
+
+        for population_mode in population_modes:
+            if population_mode not in object_population_modes:
+                continue
+
+            for window_length_days, starts in window_starts_by_length.items():
+                if len(starts) == 0:
+                    continue
+
+                ends = starts + window_length_days
+
+                # For each window, find qualifying epochs in [start, end).
+                left_indices = np.searchsorted(epochs, starts, side="left")
+                right_indices = np.searchsorted(epochs, ends, side="left")
+
+                valid_windows = np.where(right_indices > left_indices)[0]
+
+                for idx in valid_windows:
+                    i0 = left_indices[idx]
+                    i1 = right_indices[idx]
+
+                    epoch_slice = epochs[i0:i1]
+                    distance_slice = distances[i0:i1]
+
+                    first_epoch = float(epoch_slice[0])
+                    last_epoch = float(epoch_slice[-1])
+                    duration_days = last_epoch - first_epoch
+
+                    if duration_days < min_duration_days:
+                        continue
+
+                    membership_rows.append(
+                        {
+                            "population_mode": population_mode,
+                            "window_length_days": float(window_length_days),
+                            "window_step_days": float(window_step_days),
+                            "window_start": float(starts[idx]),
+                            "window_end": float(ends[idx]),
+                            "distance_min": float(distance_min),
+                            "distance_max": float(distance_max),
+                            "object_id": object_id,
+                            "population": population,
+                            "H": float(H),
+                            "D": float(D),
+                            "first_epoch_in_window": first_epoch,
+                            "last_epoch_in_window": last_epoch,
+                            "n_samples": int(len(epoch_slice)),
+                            "duration_days": float(duration_days),
+                            "min_distance": float(np.min(distance_slice)),
+                            "median_distance": float(np.median(distance_slice)),
+                        }
+                    )
+
+    return membership_rows
+
+
+# ============================================================
+# Summary tables
+# ============================================================
+
+def build_window_summary(
+    window_grid: pd.DataFrame,
+    membership_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Convert qualifying epoch rows in one window into one row per object.
+    Build one row per population mode, window length, and window start.
+
+    Includes zero-count windows.
     """
 
-    grouped = df_window.groupby(object_id_col, dropna=False)
+    key_cols = [
+        "population_mode",
+        "window_length_days",
+        "window_step_days",
+        "window_start",
+        "window_end",
+        "distance_min",
+        "distance_max",
+    ]
 
-    membership = grouped.agg(
-        H=(h_col, "first"),
-        D=(diameter_col, "first"),
-        population=("population", "first"),
-        first_epoch_in_window=(epoch_col, "min"),
-        last_epoch_in_window=(epoch_col, "max"),
-        n_samples=(epoch_col, "size"),
-        min_distance=(distance_col, "min"),
-        median_distance=(distance_col, "median"),
-    ).reset_index()
+    empty_stats = {
+        **scalar_statistics(pd.Series(dtype=float), "H"),
+        **scalar_statistics(pd.Series(dtype=float), "D"),
+    }
 
-    membership["duration_days"] = (
-        membership["last_epoch_in_window"] - membership["first_epoch_in_window"]
+    if len(membership_df) == 0:
+        out = window_grid.copy()
+        out["n_objects"] = 0
+        out["n_samples"] = 0
+        out["duration_mean_days"] = np.nan
+        out["duration_median_days"] = np.nan
+
+        for key, val in empty_stats.items():
+            out[key] = val
+
+        return out
+
+    grouped = membership_df.groupby(key_cols, dropna=False)
+
+    rows = []
+
+    for keys, g in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+
+        base = dict(zip(key_cols, keys))
+
+        H_stats = scalar_statistics(g["H"], "H")
+        D_stats = scalar_statistics(g["D"], "D")
+
+        row = {
+            **base,
+            "n_objects": int(g["object_id"].nunique()),
+            "n_samples": int(g["n_samples"].sum()),
+            "duration_mean_days": g["duration_days"].mean(),
+            "duration_median_days": g["duration_days"].median(),
+            **H_stats,
+            **D_stats,
+        }
+
+        rows.append(row)
+
+    summary_nonzero = pd.DataFrame(rows)
+
+    window_summary = window_grid.merge(
+        summary_nonzero,
+        on=key_cols,
+        how="left",
     )
 
-    return membership
+    window_summary["n_objects"] = window_summary["n_objects"].fillna(0).astype(int)
+    window_summary["n_samples"] = window_summary["n_samples"].fillna(0).astype(int)
+
+    return window_summary
+
+
+def build_sweep_summary(window_summary_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Condensed one-row-per-window-length summary.
+    """
+
+    if len(window_summary_df) == 0:
+        return pd.DataFrame()
+
+    sweep_summary = (
+        window_summary_df
+        .groupby(["population_mode", "window_length_days"], dropna=False)
+        .agg(
+            n_windows=("n_objects", "size"),
+
+            n_objects_min=("n_objects", "min"),
+            n_objects_median=("n_objects", "median"),
+            n_objects_mean=("n_objects", "mean"),
+            n_objects_max=("n_objects", "max"),
+
+            n_samples_median=("n_samples", "median"),
+            n_samples_mean=("n_samples", "mean"),
+
+            H_min_mean=("H_min", "mean"),
+            H_median_mean=("H_median", "mean"),
+            H_median_min=("H_median", "min"),
+            H_median_max=("H_median", "max"),
+            H_mean_mean=("H_mean", "mean"),
+
+            D_min_mean=("D_min", "mean"),
+            D_median_mean=("D_median", "mean"),
+            D_median_min=("D_median", "min"),
+            D_median_max=("D_median", "max"),
+            D_mean_mean=("D_mean", "mean"),
+
+            duration_mean_days=("duration_mean_days", "mean"),
+            duration_median_days=("duration_median_days", "median"),
+        )
+        .reset_index()
+    )
+
+    return sweep_summary
 
 
 # ============================================================
-# Main analysis
+# Main driver
 # ============================================================
 
-def sliding_detection_opportunities(
-    df: pd.DataFrame,
+def run_streaming_detection_analysis(
+    trajectory_folder: Path,
+    master_csv: Path,
+    output_dir: Path,
     object_id_col: str,
     epoch_col: str,
     distance_col: str,
@@ -298,212 +567,183 @@ def sliding_detection_opportunities(
     end_epoch: Optional[float] = None,
     include_partial_windows: bool = False,
     min_duration_days: float = 0.0,
+    trajectory_file_glob: str = "*.csv",
+    chunksize: int = 200_000,
     output_membership: bool = True,
+    progress_every: int = 25,
+    epoch_scan_progress_every: int = 250,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Main sliding-window detection opportunity analysis.
 
-    Returns:
-        window_summary_df
-        sweep_summary_df
-        window_membership_df
-    """
+    trajectory_folder = Path(trajectory_folder)
+    master_csv = Path(master_csv)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    required_cols = [
-        object_id_col,
-        epoch_col,
-        distance_col,
-        h_col,
-        diameter_col,
-        "population",
-    ]
+    trajectory_files = sorted(trajectory_folder.glob(trajectory_file_glob))
 
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Input dataframe is missing required columns: {missing}")
-
-    df = df.copy()
-
-    if start_epoch is None:
-        start_epoch = float(df[epoch_col].min())
-
-    if end_epoch is None:
-        end_epoch = float(df[epoch_col].max())
-
-    window_summary_rows = []
-    membership_rows = []
-
-    for population_mode in population_modes:
-        df_pop = filter_population(df, population_mode)
-
-        if len(df_pop) == 0:
-            print(f"Warning: no rows found for population_mode='{population_mode}'")
-
-        for window_length_days in window_lengths_days:
-            starts = generate_window_starts(
-                start_epoch=start_epoch,
-                end_epoch=end_epoch,
-                window_length_days=window_length_days,
-                window_step_days=window_step_days,
-                include_partial_windows=include_partial_windows,
-            )
-
-            for window_start in starts:
-                window_end = window_start + window_length_days
-
-                in_window = (
-                    (df_pop[epoch_col] >= window_start)
-                    & (df_pop[epoch_col] < window_end)
-                )
-
-                in_distance = (
-                    (df_pop[distance_col] >= distance_min)
-                    & (df_pop[distance_col] <= distance_max)
-                )
-
-                df_qual = df_pop.loc[in_window & in_distance].copy()
-
-                if len(df_qual) == 0:
-                    stats_H = scalar_statistics(pd.Series(dtype=float), "H")
-                    stats_D = scalar_statistics(pd.Series(dtype=float), "D")
-
-                    window_summary_rows.append(
-                        {
-                            "population_mode": population_mode,
-                            "window_length_days": window_length_days,
-                            "window_step_days": window_step_days,
-                            "window_start": window_start,
-                            "window_end": window_end,
-                            "distance_min": distance_min,
-                            "distance_max": distance_max,
-                            "n_objects": 0,
-                            "n_samples": 0,
-                            "duration_mean_days": np.nan,
-                            "duration_median_days": np.nan,
-                            **stats_H,
-                            **stats_D,
-                        }
-                    )
-                    continue
-
-                membership = summarize_window_membership(
-                    df_window=df_qual,
-                    object_id_col=object_id_col,
-                    epoch_col=epoch_col,
-                    distance_col=distance_col,
-                    h_col=h_col,
-                    diameter_col=diameter_col,
-                )
-
-                if min_duration_days > 0:
-                    membership = membership[
-                        membership["duration_days"] >= min_duration_days
-                    ].copy()
-
-                if len(membership) == 0:
-                    stats_H = scalar_statistics(pd.Series(dtype=float), "H")
-                    stats_D = scalar_statistics(pd.Series(dtype=float), "D")
-
-                    window_summary_rows.append(
-                        {
-                            "population_mode": population_mode,
-                            "window_length_days": window_length_days,
-                            "window_step_days": window_step_days,
-                            "window_start": window_start,
-                            "window_end": window_end,
-                            "distance_min": distance_min,
-                            "distance_max": distance_max,
-                            "n_objects": 0,
-                            "n_samples": 0,
-                            "duration_mean_days": np.nan,
-                            "duration_median_days": np.nan,
-                            **stats_H,
-                            **stats_D,
-                        }
-                    )
-                    continue
-
-                stats_H = scalar_statistics(membership["H"], "H")
-                stats_D = scalar_statistics(membership["D"], "D")
-
-                window_summary_rows.append(
-                    {
-                        "population_mode": population_mode,
-                        "window_length_days": window_length_days,
-                        "window_step_days": window_step_days,
-                        "window_start": window_start,
-                        "window_end": window_end,
-                        "distance_min": distance_min,
-                        "distance_max": distance_max,
-                        "n_objects": int(len(membership)),
-                        "n_samples": int(membership["n_samples"].sum()),
-                        "duration_mean_days": membership["duration_days"].mean(),
-                        "duration_median_days": membership["duration_days"].median(),
-                        **stats_H,
-                        **stats_D,
-                    }
-                )
-
-                if output_membership:
-                    membership = membership.rename(
-                        columns={
-                            object_id_col: "object_id",
-                        }
-                    )
-
-                    membership.insert(0, "population_mode", population_mode)
-                    membership.insert(1, "window_length_days", window_length_days)
-                    membership.insert(2, "window_step_days", window_step_days)
-                    membership.insert(3, "window_start", window_start)
-                    membership.insert(4, "window_end", window_end)
-                    membership.insert(5, "distance_min", distance_min)
-                    membership.insert(6, "distance_max", distance_max)
-
-                    membership_rows.append(membership)
-
-    window_summary_df = pd.DataFrame(window_summary_rows)
-
-    if len(window_summary_df) == 0:
-        sweep_summary_df = pd.DataFrame()
-    else:
-        sweep_summary_df = (
-            window_summary_df
-            .groupby(["population_mode", "window_length_days"], dropna=False)
-            .agg(
-                n_windows=("n_objects", "size"),
-                n_objects_min=("n_objects", "min"),
-                n_objects_median=("n_objects", "median"),
-                n_objects_mean=("n_objects", "mean"),
-                n_objects_max=("n_objects", "max"),
-                n_samples_median=("n_samples", "median"),
-                n_samples_mean=("n_samples", "mean"),
-
-                H_median_mean=("H_median", "mean"),
-                H_median_min=("H_median", "min"),
-                H_median_max=("H_median", "max"),
-                H_mean_mean=("H_mean", "mean"),
-
-                D_median_mean=("D_median", "mean"),
-                D_median_min=("D_median", "min"),
-                D_median_max=("D_median", "max"),
-                D_mean_mean=("D_mean", "mean"),
-
-                duration_mean_days=("duration_mean_days", "mean"),
-                duration_median_days=("duration_median_days", "median"),
-            )
-            .reset_index()
+    if len(trajectory_files) == 0:
+        raise FileNotFoundError(
+            f"No files matching {trajectory_file_glob} found in {trajectory_folder}"
         )
 
-    if output_membership and len(membership_rows) > 0:
-        window_membership_df = pd.concat(membership_rows, ignore_index=True)
-    else:
-        window_membership_df = pd.DataFrame()
+    print(f"Found {len(trajectory_files):,} trajectory files")
 
-    return window_summary_df, sweep_summary_df, window_membership_df
+    master = load_master_file(
+        master_csv=master_csv,
+        object_id_col=object_id_col,
+        h_col=h_col,
+        diameter_col=diameter_col,
+    )
+
+    print(f"Loaded {len(master):,} objects from master file")
+
+    master_lookup = (
+        master
+        .set_index(object_id_col)[[h_col, diameter_col, "population"]]
+        .to_dict(orient="index")
+    )
+
+    if start_epoch is None or end_epoch is None:
+        detected_start, detected_end = find_global_epoch_range(
+            trajectory_files=trajectory_files,
+            epoch_col=epoch_col,
+            chunksize=chunksize,
+            progress_every=epoch_scan_progress_every,
+        )
+
+        if start_epoch is None:
+            start_epoch = detected_start
+
+        if end_epoch is None:
+            end_epoch = detected_end
+
+    print(f"Analysis epoch range: {start_epoch} to {end_epoch}")
+
+    window_grid = make_window_grid(
+        population_modes=population_modes,
+        window_lengths_days=window_lengths_days,
+        window_step_days=window_step_days,
+        start_epoch=start_epoch,
+        end_epoch=end_epoch,
+        distance_min=distance_min,
+        distance_max=distance_max,
+        include_partial_windows=include_partial_windows,
+    )
+
+    print(f"Generated {len(window_grid):,} total windows")
+
+    window_starts_by_length = {
+        float(L): generate_window_starts(
+            start_epoch=start_epoch,
+            end_epoch=end_epoch,
+            window_length_days=float(L),
+            window_step_days=window_step_days,
+            include_partial_windows=include_partial_windows,
+        )
+        for L in window_lengths_days
+    }
+
+    print("Window counts by length:")
+    for L, starts in window_starts_by_length.items():
+        print(f"  {L:g} days: {len(starts):,} windows")
+
+    all_membership_rows = []
+
+    start_time_wall = time.time()
+
+    n_files_total = len(trajectory_files)
+    n_files_processed = 0
+    n_files_with_matches = 0
+    n_membership_rows_total = 0
+
+    print("Processing trajectory files...")
+
+    for i, file in enumerate(trajectory_files, start=1):
+        rows = process_one_trajectory_file(
+            file=file,
+            master_lookup=master_lookup,
+            object_id_col=object_id_col,
+            epoch_col=epoch_col,
+            distance_col=distance_col,
+            h_col=h_col,
+            diameter_col=diameter_col,
+            distance_min=distance_min,
+            distance_max=distance_max,
+            population_modes=population_modes,
+            window_starts_by_length=window_starts_by_length,
+            window_step_days=window_step_days,
+            min_duration_days=min_duration_days,
+            chunksize=chunksize,
+        )
+
+        n_files_processed += 1
+
+        if rows:
+            all_membership_rows.extend(rows)
+            n_files_with_matches += 1
+            n_membership_rows_total += len(rows)
+
+        if i == 1 or i == n_files_total or i % progress_every == 0:
+            elapsed = time.time() - start_time_wall
+            files_per_sec = n_files_processed / elapsed if elapsed > 0 else np.nan
+
+            remaining_files = n_files_total - n_files_processed
+            eta_sec = remaining_files / files_per_sec if files_per_sec > 0 else np.nan
+
+            percent_done = 100.0 * n_files_processed / n_files_total
+
+            print(
+                f"[{n_files_processed:,}/{n_files_total:,} objects] "
+                f"{percent_done:6.2f}% complete | "
+                f"current: {file.name} | "
+                f"objects with opportunities: {n_files_with_matches:,} | "
+                f"membership rows: {n_membership_rows_total:,} | "
+                f"elapsed: {elapsed / 60:.1f} min | "
+                f"ETA: {eta_sec / 60:.1f} min"
+            )
+
+    if all_membership_rows:
+        membership_df = pd.DataFrame(all_membership_rows)
+    else:
+        membership_df = pd.DataFrame()
+
+    print("Building window summary...")
+    window_summary_df = build_window_summary(
+        window_grid=window_grid,
+        membership_df=membership_df,
+    )
+
+    print("Building sweep summary...")
+    sweep_summary_df = build_sweep_summary(window_summary_df)
+
+    window_summary_path = output_dir / "window_summary.csv"
+    sweep_summary_path = output_dir / "sweep_summary.csv"
+    membership_path = output_dir / "window_membership.csv"
+
+    window_summary_df.to_csv(window_summary_path, index=False)
+    sweep_summary_df.to_csv(sweep_summary_path, index=False)
+
+    if output_membership:
+        membership_df.to_csv(membership_path, index=False)
+
+    total_elapsed = time.time() - start_time_wall
+
+    print("\nDone.")
+    print(f"Total processing time: {total_elapsed / 60:.1f} min")
+    print(f"Objects processed: {n_files_processed:,}")
+    print(f"Objects with opportunities: {n_files_with_matches:,}")
+    print(f"Membership rows: {n_membership_rows_total:,}")
+    print(f"Wrote {window_summary_path}")
+    print(f"Wrote {sweep_summary_path}")
+
+    if output_membership:
+        print(f"Wrote {membership_path}")
+
+    return window_summary_df, sweep_summary_df, membership_df
 
 
 # ============================================================
-# PyCharm configuration section
+# PyCharm configuration
 # ============================================================
 
 if __name__ == "__main__":
@@ -513,18 +753,16 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
 
     TRAJECTORY_FOLDER = Path(
-        r"/path/to/folder/with/one_csv_per_object"
+        r"/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb"
     )
 
     MASTER_CSV = Path(
-        r"/path/to/master.csv"
+        r"/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb/minimoon_master_with_L1_geo_omega_w_earth.csv"
     )
 
     OUTPUT_DIR = Path(
-        r"/path/to/output_folder"
+        r"tbo_window_results"
     )
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------
     # Column names
@@ -533,61 +771,59 @@ if __name__ == "__main__":
     OBJECT_ID_COL = "Object id"
     EPOCH_COL = "Julian Date"
 
-    # Choose which distance column defines the opportunity.
+    # Choose the distance column used for the opportunity definition.
     #
-    # Options from your trajectory files include, for example:
+    # Available examples from your trajectory files:
     #   "Distance"
     #   "sunearthl1-ast-dist"
     #   "sun-ast-dist"
     #
-    # Since you said au, distance_min and distance_max below should also be in au.
+    # Units should match DISTANCE_MIN and DISTANCE_MAX.
     DISTANCE_COL = "Distance"
 
+    # H and D come from the master file.
     H_COL = "H"
-
-    # Diameter column in the master file.
-    # You said this is D in meters.
     DIAMETER_COL = "D"
 
     # ------------------------------------------------------------
-    # Distance opportunity definition
+    # Detection opportunity definition
     # ------------------------------------------------------------
 
     DISTANCE_MIN = 0.0
     DISTANCE_MAX = 0.03
 
-    # Example:
-    #   0.03 au is approximately 3 Earth Hill radii if that is your convention.
-    #   You can also use 0.01 for approximately 1 Earth Hill radius.
-
     # ------------------------------------------------------------
-    # Window sweep
+    # Sliding-window sweep
     # ------------------------------------------------------------
 
     WINDOW_LENGTHS_DAYS = [
-        30.0,
-        90.0,
         180.0,
         365.25,
         730.5,
+        365.25 * 3,
+        365.25 * 4,
+        365.25 * 5,
     ]
 
-    # Window starts are separated by this step, regardless of window length.
-    WINDOW_STEP_DAYS = 30.0
+    # Window start spacing, independent of window length.
+    WINDOW_STEP_DAYS = 180.0
 
-    # Leave as None to use min/max Julian Date from the loaded trajectory files.
+    # Leave these as None to infer from all trajectory files.
+    # If you already know the date range, setting these manually avoids
+    # the initial epoch-scan pass and saves time.
     START_EPOCH = None
     END_EPOCH = None
 
-    # If False, only windows fully contained in [START_EPOCH, END_EPOCH] are used.
+    # If False, only complete windows are included.
+    # If True, windows that extend past END_EPOCH are included.
     INCLUDE_PARTIAL_WINDOWS = False
 
     # ------------------------------------------------------------
     # Population modes
     # ------------------------------------------------------------
 
-    # Object id starting with NESC -> synthetic.
-    # Anything else -> real.
+    # Object IDs beginning with NESC are synthetic.
+    # All other object IDs are real.
     #
     # Options:
     #   ["synthetic"]
@@ -595,90 +831,62 @@ if __name__ == "__main__":
     #   ["both"]
     #   ["synthetic", "real", "both"]
     POPULATION_MODES = [
-        "synthetic",
-        "real",
-        "both",
+        "synthetic"
     ]
 
     # ------------------------------------------------------------
-    # Duration filtering
+    # Duration filter
     # ------------------------------------------------------------
 
-    # If 0.0, a single qualifying epoch is enough for an object to count.
-    #
-    # If > 0.0, the object must remain in the distance range inside the window
-    # for at least this estimated duration:
-    #
-    #   last qualifying epoch - first qualifying epoch
-    #
+    # 0.0 means a single qualifying epoch is enough.
+    # If set to e.g. 7.0, the object must have at least 7 days between
+    # first and last qualifying epoch inside the window.
     MIN_DURATION_DAYS = 0.0
 
     # ------------------------------------------------------------
-    # Output options
+    # Memory and progress settings
     # ------------------------------------------------------------
 
-    OUTPUT_MEMBERSHIP = True
-
     TRAJECTORY_FILE_GLOB = "*.csv"
+
+    # Number of rows read at a time from each trajectory file.
+    # Increase for speed, decrease for lower memory.
+    CHUNKSIZE = 200_000
+
+    # Print progress every this many objects.
+    PROGRESS_EVERY = 25
+
+    # During the initial epoch scan, print progress every this many files.
+    EPOCH_SCAN_PROGRESS_EVERY = 250
+
+    # Whether to write the detailed per-object per-window membership file.
+    OUTPUT_MEMBERSHIP = True
 
     # ------------------------------------------------------------
     # Run
     # ------------------------------------------------------------
 
-    master_df = load_master_file(
-        master_csv=MASTER_CSV,
-        object_id_col=OBJECT_ID_COL,
-        h_col=H_COL,
-        diameter_col=DIAMETER_COL,
-    )
-
-    trajectory_df = load_trajectory_folder(
+    window_summary_df, sweep_summary_df, membership_df = run_streaming_detection_analysis(
         trajectory_folder=TRAJECTORY_FOLDER,
-        master=master_df,
+        master_csv=MASTER_CSV,
+        output_dir=OUTPUT_DIR,
         object_id_col=OBJECT_ID_COL,
         epoch_col=EPOCH_COL,
         distance_col=DISTANCE_COL,
         h_col=H_COL,
         diameter_col=DIAMETER_COL,
-        file_glob=TRAJECTORY_FILE_GLOB,
+        distance_min=DISTANCE_MIN,
+        distance_max=DISTANCE_MAX,
+        window_lengths_days=WINDOW_LENGTHS_DAYS,
+        window_step_days=WINDOW_STEP_DAYS,
+        population_modes=POPULATION_MODES,
+        start_epoch=START_EPOCH,
+        end_epoch=END_EPOCH,
+        include_partial_windows=INCLUDE_PARTIAL_WINDOWS,
+        min_duration_days=MIN_DURATION_DAYS,
+        trajectory_file_glob=TRAJECTORY_FILE_GLOB,
+        chunksize=CHUNKSIZE,
+        output_membership=OUTPUT_MEMBERSHIP,
+        progress_every=PROGRESS_EVERY,
+        epoch_scan_progress_every=EPOCH_SCAN_PROGRESS_EVERY,
     )
-
-    print(f"Loaded {len(trajectory_df):,} trajectory rows")
-    print(f"Loaded {trajectory_df[OBJECT_ID_COL].nunique():,} unique objects")
-
-    window_summary_df, sweep_summary_df, window_membership_df = (
-        sliding_detection_opportunities(
-            df=trajectory_df,
-            object_id_col=OBJECT_ID_COL,
-            epoch_col=EPOCH_COL,
-            distance_col=DISTANCE_COL,
-            h_col=H_COL,
-            diameter_col=DIAMETER_COL,
-            distance_min=DISTANCE_MIN,
-            distance_max=DISTANCE_MAX,
-            window_lengths_days=WINDOW_LENGTHS_DAYS,
-            window_step_days=WINDOW_STEP_DAYS,
-            population_modes=POPULATION_MODES,
-            start_epoch=START_EPOCH,
-            end_epoch=END_EPOCH,
-            include_partial_windows=INCLUDE_PARTIAL_WINDOWS,
-            min_duration_days=MIN_DURATION_DAYS,
-            output_membership=OUTPUT_MEMBERSHIP,
-        )
-    )
-
-    window_summary_path = OUTPUT_DIR / "window_summary.csv"
-    sweep_summary_path = OUTPUT_DIR / "sweep_summary.csv"
-    membership_path = OUTPUT_DIR / "window_membership.csv"
-
-    window_summary_df.to_csv(window_summary_path, index=False)
-    sweep_summary_df.to_csv(sweep_summary_path, index=False)
-
-    if OUTPUT_MEMBERSHIP:
-        window_membership_df.to_csv(membership_path, index=False)
-
-    print(f"Wrote {window_summary_path}")
-    print(f"Wrote {sweep_summary_path}")
-
-    if OUTPUT_MEMBERSHIP:
-        print(f"Wrote {membership_path}")
