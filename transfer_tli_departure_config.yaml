@@ -1,0 +1,59 @@
+# tli_departure_config.yaml
+
+spice:
+  kernels:
+    - "naif0012.tls"
+    - "de430.bsp"
+
+files:
+  output_dir: "transfer/tli_departure_output"
+
+epoch:
+  # Target LPF row time. Later you can pull this directly from LPF_orbit_2.csv row 140000.
+  target_time_utc: "2015-12-03 04:45:42.081531370"
+
+  # Fixed transfer time from cislunar release state to LPF target state.
+  tof_days: 90.0
+
+injection:
+  # This is not literal LEO/TLI burn injection.
+  # Interpret as a cislunar/post-TLI release boundary state.
+  boundary_type: "post_tli_cislunar_release"
+
+  # Earth-centered radius of release state.
+  r0_mag_km: 300000.0
+
+  # Geocentric two-body C3. Negative means still Earth-bound.
+  C3_km2_s2: -2.0
+
+  # Position direction constraint.
+  # phi_r = 0 means position is exactly along Earth -> Moon.
+  phi_r_deg: 0.0
+
+  # Velocity lead angle in the Earth-Moon plane.
+  # Positive means leading toward lunar motion direction.
+  phi_v_deg: 15.0
+
+  # Small out-of-plane velocity tilt.
+  out_of_plane_v_deg: 0.0
+
+  # Optional small out-of-plane position tilt.
+  # Usually leave this zero for a TLI-like planar release.
+  out_of_plane_r_deg: 0.0
+
+constraints:
+  # These are used for warnings/checks only in this stage.
+  max_abs_phi_r_deg: 60.0
+  min_phi_v_deg: -30.0
+  max_phi_v_deg: 60.0
+  max_abs_out_of_plane_v_deg: 15.0
+
+visualization:
+  enabled: true
+  show_plot: true
+  save_plot: false
+  filename: "tli_departure_geometry.png"
+
+output:
+  save_state_json: true
+  save_state_csv: true
