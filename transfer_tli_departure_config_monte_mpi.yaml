@@ -1,0 +1,267 @@
+# ==============================================================================
+# transfer_tli_departure_config_monte_mpi.yaml
+# ------------------------------------------------------------------------------
+# MPI-only configuration for:
+#   transfer_build_tli_departure_state_monte_mpi.py
+#
+# Purpose:
+#   Run the ballistic TLI-like / cislunar release-state sweep in parallel using
+#   MPI. Samples are split across MPI ranks using deterministic round-robin
+#   assignment: rank r runs samples r, r+n_ranks, r+2*n_ranks, ...
+#
+# This config intentionally excludes plotting/visualization settings. The MPI
+# script writes CSV/JSON outputs only. Use the serial script/config for plotting
+# or interactive debugging.
+#
+# Example runs:
+#   mpiexec -n 8 python transfer_build_tli_departure_state_monte_mpi.py transfer_tli_departure_config_monte_mpi.yaml
+#   srun -n 192 python transfer_build_tli_departure_state_monte_mpi.py transfer_tli_departure_config_monte_mpi.yaml
+#
+# State convention:
+#   Earth-centered J2000/EME, [x,y,z,vx,vy,vz], km and km/s.
+# ================================================================================
+
+# ==============================================================================
+# MPI SETTINGS
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# progress_every:
+#   Each rank prints a progress message every N local samples. Set to 0 to silence
+#   per-sample progress messages.
+#
+# rank_progress:
+#   If true, ranks print assigned sample counts and progress messages.
+#
+# save_rank_outputs:
+#   If true, each rank writes its own partial CSV in:
+#       files.output_dir / rank_output_subdir
+#   This is useful for long HPC runs because partial rank products remain useful
+#   if the job fails before final rank-0 aggregation.
+#
+# rank_output_subdir:
+#   Subdirectory for optional per-rank CSV files.
+# ================================================================================
+mpi:
+  progress_every: 25
+  rank_progress: true
+  save_rank_outputs: true
+  rank_output_subdir: "rank_outputs"
+
+
+# ==============================================================================
+# SPICE KERNELS
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# Kernels loaded independently by every MPI rank through spiceypy. Ensure these
+# paths are valid from the directory where the MPI job is launched.
+# ================================================================================
+spice:
+  kernels:
+    - "naif0012.tls"        # Leapseconds kernel; required for UTC/ET conversion.
+    - "de430.bsp"           # Planetary ephemeris used by the n-body propagator.
+
+
+# ==============================================================================
+# FILE LOCATIONS
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# constants_yaml:
+#   Constants file used by NBodyPropagator, e.g. G, KM_TO_M, body masses.
+#
+# lpf_orbit_csv:
+#   Reference LPF/quasi-halo trajectory CSV. The target row is selected below.
+#
+# output_dir:
+#   MPI sweep output directory. Rank 0 writes final summary products here.
+#   Optional per-rank CSVs are written under output_dir/rank_outputs.
+# ================================================================================
+files:
+  constants_yaml: "constants.yaml"
+  lpf_orbit_csv: "LPF_orbit_2.csv"
+  output_dir: "transfer/ballistic_sweep_output_mpi"
+
+
+# ==============================================================================
+# TARGET STATE
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# target_index:
+#   Row index in LPF_orbit_csv used as the target quasi-halo state.
+#
+# time_column:
+#   UTC-like time column in LPF_orbit_csv. The script converts this to JDTDB.
+#
+# state_columns_geo_eme:
+#   Columns defining the 6D Earth-centered EME/J2000 target state.
+# ================================================================================
+target:
+  target_index: 140000
+  time_column: "Time"
+  state_columns_geo_eme:
+    - "GEO_EME_X_(km)"
+    - "GEO_EME_Y_(km)"
+    - "GEO_EME_Z_(km)"
+    - "GEO_EME_Vx_(km/s)"
+    - "GEO_EME_Vy_(km/s)"
+    - "GEO_EME_Vz_(km/s)"
+
+
+# ==============================================================================
+# TRANSFER EPOCH / TIME OF FLIGHT
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# tof_days:
+#   Transfer duration. Departure epoch is computed as:
+#       t_departure = t_target - tof_days
+# ================================================================================
+epoch:
+  tof_days: 90.0
+
+
+# ==============================================================================
+# N-BODY PROPAGATION SETTINGS
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# step_days:
+#   Output sampling step for trajectory histories. The integrator still adapts
+#   internally. The summary metrics are evaluated from the propagated output.
+#
+# debug_duration_days:
+#   null = propagate to target epoch. Set to e.g. 10.0 for a shortened MPI debug
+#   run without changing the nominal target epoch.
+#
+# frame/origin/bodies:
+#   Passed into NBodyPropagator. Origin 399 = Earth. Bodies are NAIF IDs.
+# ================================================================================
+propagation:
+  enabled: true
+  step_days: 0.5
+  debug_duration_days: null
+
+  frame: "J2000"
+  origin: "399"
+  method: "DOP853"
+  rtol: 1.0e-10
+  atol: 1.0e-12
+
+  bodies:
+    - "10"     # Sun
+    - "1"      # Mercury barycenter
+    - "2"      # Venus barycenter
+    - "399"    # Earth
+    - "4"      # Mars barycenter
+    - "5"      # Jupiter barycenter
+    - "6"      # Saturn barycenter
+    - "7"      # Uranus barycenter
+    - "8"      # Neptune barycenter
+    - "301"    # Moon
+
+
+# ==============================================================================
+# BALLISTIC RELEASE SWEEP
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# This block defines the broad cislunar/TLI-like release-state design-space sweep.
+# It is not an injection dispersion model. It is used to identify viable delivery
+# geometries before maneuver optimization.
+#
+# mode:
+#   grid   = use np.linspace(min,max,n) for each parameter and take Cartesian product.
+#   random = draw n_random independent uniform samples over each parameter range.
+#
+# Important MPI behavior:
+#   All ranks generate the same global sample list from this block. The MPI script
+#   then applies round-robin splitting. This keeps sample_id deterministic across
+#   different MPI sizes.
+# ================================================================================
+sweep:
+  enabled: true
+  mode: "grid"
+
+  n_random: 200
+  random_seed: 7
+
+  # Geocentric release radius magnitude [km].
+  r0_mag_km:
+    min: 150000.0
+    max: 350000.0
+    n: 3
+
+  # Geocentric characteristic energy at release [km^2/s^2].
+  C3_km2_s2:
+    min: -3.0
+    max: -0.5
+    n: 3
+
+  # Position angle offset from Earth-Moon line in the Earth-Moon plane [deg].
+  phi_r_deg:
+    min: -45.0
+    max: 45.0
+    n: 3
+
+  # Velocity lead angle in the Earth-Moon plane [deg].
+  phi_v_deg:
+    min: -10.0
+    max: 45.0
+    n: 3
+
+  # Position out-of-plane offset relative to Earth-Moon plane [deg].
+  out_of_plane_r_deg:
+    min: 0.0
+    max: 0.0
+    n: 1
+
+  # Velocity out-of-plane offset relative to Earth-Moon plane [deg].
+  out_of_plane_v_deg:
+    min: -10.0
+    max: 10.0
+    n: 1
+
+
+# ==============================================================================
+# BALLISTIC PROXY COST
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# This cost ranks ballistic cases before maneuver optimization. It is NOT the
+# actual transfer delta-V. The actual delta-V comes from the later optimization
+# scripts.
+#
+# J approx = ||final position miss|| / r_error_scale
+#          + ||final velocity miss|| / v_error_scale
+#          + optional plausibility penalties
+# ================================================================================
+cost:
+  r_error_scale_km: 1000000.0
+  v_error_scale_kms: 1.0
+
+  C3_reference_km2_s2: -2.0
+  C3_weight: 0.0
+
+  min_moon_distance_soft_km: 10000.0
+  moon_close_penalty_weight: 10.0
+
+  min_earth_distance_soft_km: 50000.0
+  earth_close_penalty_weight: 5.0
+
+
+# ==============================================================================
+# OUTPUT TOGGLES
+# Used by: transfer_build_tli_departure_state_monte_mpi.py
+# ------------------------------------------------------------------------------
+# save_summary_csv:
+#   Rank 0 writes ballistic_release_sweep_summary.csv.
+#
+# save_summary_json:
+#   Rank 0 writes ballistic_release_sweep_metadata.json.
+#
+# save_best_trajectory_csv:
+#   Rank 0 repropagates the lowest proxy-cost case and writes its trajectory CSV.
+#
+# save_average_trajectory_csv:
+#   Rank 0 repropagates the median-proxy-cost case and writes its trajectory CSV.
+# ================================================================================
+output:
+  save_summary_csv: true
+  save_summary_json: true
+  save_best_trajectory_csv: true
+  save_average_trajectory_csv: true
