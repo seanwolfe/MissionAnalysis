@@ -28,7 +28,7 @@ import pandas as pd
 # -----------------------------------------------------------------------------
 # Set INPUT_CSV to your trajectory file and run the script directly, or provide
 # the input path on the command line. A command-line path overrides INPUT_CSV.
-INPUT_CSV = Path(r"median_dv_84739_TCM-1_plus_TCM-2_plus_TCM-3_plus_ACQ_trajectory.csv")
+INPUT_CSV = Path(r"best_dv_296749_TCM-1_plus_TCM-2_plus_TCM-3_plus_ACQ_trajectory.csv")
 
 # Leave as None to create <input_stem>_spenvis_gei_b1950.txt beside the CSV.
 OUTPUT_FILE: Path | None = None
