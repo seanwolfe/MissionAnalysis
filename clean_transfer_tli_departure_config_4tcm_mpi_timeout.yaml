@@ -63,9 +63,9 @@ mpi:
   save_rank_outputs: true
 
 runtime:
-  walltime_hours: 23.0
+  walltime_hours: 72.0
   save_before_walltime_minutes: 45.0
-  max_optimization_minutes: 180.0
+  max_optimization_minutes: 30.0
 
 
 # ==============================================================================
@@ -98,7 +98,7 @@ spice:
 files:
   constants_yaml: "constants.yaml"
   lpf_orbit_csv: "LPF_orbit_2.csv"
-  output_dir: "transfer/ballistic_sweep_output_mpi"
+  output_dir: "results/transfer_results/ballistic_sweep_output_mpi"
 
 
 # ==============================================================================
@@ -285,8 +285,8 @@ cost:
 maneuver_optimization:
   enabled: false
 
-  input_summary_csv: "transfer/ballistic_sweep_output/ballistic_release_sweep_summary.csv"
-  output_dir: "transfer/maneuver_optimization_output"
+  input_summary_csv: "results/transfer_results/transfer_60d/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
+  output_dir: "results/transfer_results/maneuver_optimization_output"
 
   run_mode: "percentile_cases"
   top_n: 25
@@ -320,11 +320,11 @@ maneuver_optimization:
 four_burn_optimization:
   enabled: true
 
-  input_mode: "ballistic_summary"  # Change to "dispersion" for dispersion study.
+  input_mode: "dispersion"  # Change to "dispersion" for dispersion study.
 
-  input_summary_csv: "transfer/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
-  nominal_optimized_summary_csv: "transfer/four_burn_optimization_output/four_burn_optimized_sweep_summary.csv"
-  output_dir: "transfer/four_burn_dispersion_output_mpi"
+  input_summary_csv: "results/transfer_results/transfer_60d/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
+  nominal_optimized_summary_csv: "results/transfer_results/transfer_60d/four_burn_dispersion_output_mpi/four_burn_optimized_sweep_summary.csv"
+  output_dir: "results/transfer_results/four_burn_dispersion_output_mpi"
 
   run_mode: "percentile_cases"
   top_n: 25
@@ -381,7 +381,7 @@ nominal_case:
 # ==============================================================================
 dispersion:
   enabled: true
-  n_samples: 2
+  n_samples: 100
   random_seed: 42
   frame: "rtn"
 
