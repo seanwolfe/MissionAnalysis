@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import spiceypy as spice
 from scipy.optimize import least_squares
+import matplotlib.pyplot as plt
 
 from n_body_integrator import NBodyPropagator
 

@@ -135,7 +135,7 @@ target:
 #       t_departure = t_target - tof_days
 # ==============================================================================
 epoch:
-  tof_days: 90.0
+  tof_days: 60.0
 
 
 # ==============================================================================
@@ -354,7 +354,7 @@ four_burn_optimization:
 #   sample_id = use a specific sample_id.
 # ==============================================================================
 nominal_case:
-  selection: "best_dv"
+  selection: "median_dv"
   sample_id: 0
   require_target_success: true
 
