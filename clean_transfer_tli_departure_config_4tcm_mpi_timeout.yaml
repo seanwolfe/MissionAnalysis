@@ -135,7 +135,7 @@ target:
 #       t_departure = t_target - tof_days
 # ==============================================================================
 epoch:
-  tof_days: 60.0
+  tof_days: 90.0
 
 
 # ==============================================================================
@@ -285,7 +285,7 @@ cost:
 maneuver_optimization:
   enabled: false
 
-  input_summary_csv: "results/transfer_results/transfer_60d/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
+  input_summary_csv: "results/transfer_results/transfer_90d/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
   output_dir: "results/transfer_results/maneuver_optimization_output"
 
   run_mode: "percentile_cases"
@@ -322,9 +322,9 @@ four_burn_optimization:
 
   input_mode: "dispersion"  # Change to "dispersion" for dispersion study.
 
-  input_summary_csv: "results/transfer_results/transfer_60d/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
-  nominal_optimized_summary_csv: "results/transfer_results/transfer_60d/four_burn_dispersion_output_mpi/four_burn_optimized_sweep_summary.csv"
-  output_dir: "results/transfer_results/four_burn_dispersion_output_mpi"
+  input_summary_csv: "results/transfer_results/transfer_90d/ballistic_sweep_output_mpi/ballistic_release_sweep_summary.csv"
+  nominal_optimized_summary_csv: "results/transfer_results/transfer_90d/four_burn_dispersion_output_mpi/four_burn_optimized_sweep_summary.csv"
+  output_dir: "results/transfer_results/four_burn_dispersion_output_mpi_sample272882"
 
   run_mode: "percentile_cases"
   top_n: 25
@@ -354,8 +354,8 @@ four_burn_optimization:
 #   sample_id = use a specific sample_id.
 # ==============================================================================
 nominal_case:
-  selection: "median_dv"
-  sample_id: 0
+  selection: "sample_id"
+  sample_id: 272882
   require_target_success: true
 
 
