@@ -168,7 +168,7 @@ ASTEROID_ANGULAR_RATE_OVERRIDE_ARCSEC_S: float | None = None
 # -----------------------------------------------------------------------------
 # All positions and velocities must use the same origin, axes, frame, and
 # representative epoch. Positions are km and velocities are km/s.
-OBSERVER_POSITION_KM = np.array([-1.50e6, 8.0e5, 0.0], dtype=float)
+OBSERVER_POSITION_KM = np.array([-1.50e6, 8.0e5, 0.0e5], dtype=float)
 OBSERVER_VELOCITY_KM_S = np.array([0.0, -0.20, 0.0], dtype=float)
 
 SUN_POSITION_KM = np.array([-149_597_870.7, 0.0, 0.0], dtype=float)
@@ -226,7 +226,7 @@ MASK_INSIDE_SUN = True
 # plane is used and the actual selected coordinate is reported.
 SLICE_X_OFFSET_KM = 0.0  # y-z contour
 SLICE_Y_OFFSET_KM = 0.0  # x-z contour
-SLICE_Z_OFFSET_KM = 0.0  # x-y contour
+SLICE_Z_OFFSET_KM = 0.0e5  # x-y contour
 
 # Plot distance scaling. For example, 1000.0 displays axes in 10^3 km.
 PLOT_DISTANCE_SCALE_KM = 100000.0

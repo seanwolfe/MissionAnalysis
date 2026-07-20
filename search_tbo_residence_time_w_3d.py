@@ -13,14 +13,19 @@ from matplotlib.patches import Circle, Ellipse
 # ============================================================
 
 AU_KM = 149_597_870.7
+AU_TO_MILLION_KM = AU_KM / 1.0e6
 
 ONE_EH_AU = 0.01
+ONE_EH_MILLION_KM = ONE_EH_AU * AU_TO_MILLION_KM
 
 HALO_Y_RADIUS_KM = 800_000.0
 HALO_Z_RADIUS_KM = 500_000.0
 
 HALO_Y_RADIUS_AU = HALO_Y_RADIUS_KM / AU_KM
 HALO_Z_RADIUS_AU = HALO_Z_RADIUS_KM / AU_KM
+
+HALO_Y_RADIUS_MILLION_KM = HALO_Y_RADIUS_KM / 1.0e6
+HALO_Z_RADIUS_MILLION_KM = HALO_Z_RADIUS_KM / 1.0e6
 
 
 # ============================================================
@@ -77,6 +82,26 @@ def filter_candidate_files(
     return files
 
 
+def get_histogram_bin_indices(
+    values: np.ndarray,
+    edges: np.ndarray,
+) -> np.ndarray:
+    """
+    Return zero-based histogram-bin indices matching NumPy histogram rules.
+
+    Values on the final edge are assigned to the final bin. Values outside
+    the edge interval retain an invalid index and can be removed by the caller.
+    """
+    indices = np.searchsorted(edges, values, side="right") - 1
+
+    # np.histogram includes a value exactly equal to the final edge in the
+    # final bin. searchsorted(..., side="right") would otherwise place it one
+    # index beyond the valid range.
+    indices[values == edges[-1]] = len(edges) - 2
+
+    return indices
+
+
 # ============================================================
 # Residence-time accumulation
 # ============================================================
@@ -96,11 +121,13 @@ def accumulate_synthetic_residence_time_maps(
     overlay_real_tbos: bool = True,
     real_overlay_max_points_per_object: int = 2_000,
     exclude_file_keywords: list[str] | None = None,
+    accumulate_3d: bool = True,
 ):
     """
     Build synthetic-only residence-time histograms in:
         - XY projection
         - YZ projection
+        - XYZ volume, when accumulate_3d is True
 
     Color quantity:
         total synthetic residence time in days.
@@ -123,6 +150,21 @@ def accumulate_synthetic_residence_time_maps(
 
     H_xy = np.zeros((len(x_edges) - 1, len(y_edges) - 1), dtype=float)
     H_yz = np.zeros((len(y_edges) - 1, len(z_edges) - 1), dtype=float)
+
+    # At NX = NY = NZ = 300, this array contains 27 million float64 values
+    # and requires approximately 216 MB. It is accumulated directly using
+    # indexed additions so that a second full-sized temporary histogram is not
+    # created for every trajectory file.
+    H_xyz = None
+    if accumulate_3d:
+        H_xyz = np.zeros(
+            (
+                len(x_edges) - 1,
+                len(y_edges) - 1,
+                len(z_edges) - 1,
+            ),
+            dtype=float,
+        )
 
     real_overlay = []
 
@@ -239,6 +281,31 @@ def accumulate_synthetic_residence_time_maps(
             weights=dt,
         )[0]
 
+        if H_xyz is not None:
+            ix = get_histogram_bin_indices(x_mid, x_edges)
+            iy = get_histogram_bin_indices(y_mid, y_edges)
+            iz = get_histogram_bin_indices(z_mid, z_edges)
+
+            valid_3d = (
+                (ix >= 0)
+                & (ix < H_xyz.shape[0])
+                & (iy >= 0)
+                & (iy < H_xyz.shape[1])
+                & (iz >= 0)
+                & (iz < H_xyz.shape[2])
+            )
+
+            if np.any(valid_3d):
+                np.add.at(
+                    H_xyz,
+                    (
+                        ix[valid_3d],
+                        iy[valid_3d],
+                        iz[valid_3d],
+                    ),
+                    dt[valid_3d],
+                )
+
         total_synthetic_time_days += np.sum(dt)
 
         n_objects_processed += 1
@@ -263,6 +330,7 @@ def accumulate_synthetic_residence_time_maps(
     return {
         "H_xy": H_xy,
         "H_yz": H_yz,
+        "H_xyz": H_xyz,
         "real_overlay": real_overlay,
         "n_objects_processed": n_objects_processed,
         "n_synthetic_used": n_synthetic_used,
@@ -425,6 +493,102 @@ def save_histogram_csv(
     pd.DataFrame(rows).to_csv(output_csv, index=False)
 
 
+def save_sparse_histogram_3d_csv(
+    H_xyz: np.ndarray,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    z_edges: np.ndarray,
+    output_csv: Path,
+    coordinate_unit: str = "km",
+    min_residence_time_days: float = 0.0,
+) -> int:
+    """
+    Save the nonzero cells of a 3D residence-time histogram.
+
+    A dense 300 x 300 x 300 CSV would contain 27 million rows, most of which
+    may have zero residence time. The boresight optimization only needs cells
+    with positive residence time, so this writer stores a sparse table.
+
+    Parameters
+    ----------
+    H_xyz
+        Residence time in days per 3D histogram cell.
+    x_edges, y_edges, z_edges
+        Histogram edges in AU.
+    output_csv
+        Destination CSV.
+    coordinate_unit
+        Either "km" or "au" for the saved cell-centre coordinates.
+    min_residence_time_days
+        Cells at or below this value are omitted.
+
+    Returns
+    -------
+    int
+        Number of rows written.
+    """
+    coordinate_unit = coordinate_unit.lower()
+    if coordinate_unit not in {"km", "au"}:
+        raise ValueError("coordinate_unit must be either 'km' or 'au'")
+
+    x_centers_au = 0.5 * (x_edges[:-1] + x_edges[1:])
+    y_centers_au = 0.5 * (y_edges[:-1] + y_edges[1:])
+    z_centers_au = 0.5 * (z_edges[:-1] + z_edges[1:])
+
+    if coordinate_unit == "km":
+        scale = AU_KM
+        x_name = "Synodic x (km)"
+        y_name = "Synodic y (km)"
+        z_name = "Synodic z (km)"
+    else:
+        scale = 1.0
+        x_name = "Synodic x (AU)"
+        y_name = "Synodic y (AU)"
+        z_name = "Synodic z (AU)"
+
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    first_chunk = True
+    n_rows_written = 0
+
+    # Write one x-slice at a time so the full sparse table is never duplicated
+    # in memory as one very large DataFrame.
+    for ix, xc_au in enumerate(x_centers_au):
+        yz_slice = H_xyz[ix]
+        iy, iz = np.nonzero(yz_slice > min_residence_time_days)
+
+        if len(iy) == 0:
+            continue
+
+        chunk = pd.DataFrame(
+            {
+                x_name: np.full(len(iy), xc_au * scale),
+                y_name: y_centers_au[iy] * scale,
+                z_name: z_centers_au[iz] * scale,
+                "residence_time_days": yz_slice[iy, iz],
+            }
+        )
+
+        chunk.to_csv(
+            output_csv,
+            mode="w" if first_chunk else "a",
+            header=first_chunk,
+            index=False,
+        )
+
+        first_chunk = False
+        n_rows_written += len(chunk)
+
+    if first_chunk:
+        # Ensure that an empty but valid CSV is still produced.
+        pd.DataFrame(
+            columns=[x_name, y_name, z_name, "residence_time_days"]
+        ).to_csv(output_csv, index=False)
+
+    return n_rows_written
+
+
 def load_histogram_csv(
     grid_csv: Path,
     x_name: str,
@@ -529,20 +693,23 @@ def add_common_xy_overlays(
     if overlay_1eh:
         circle = Circle(
             (0.0, 0.0),
-            ONE_EH_AU,
+            ONE_EH_MILLION_KM,
             fill=False,
             color="cyan",
             linestyle="--",
             linewidth=1.5,
             zorder=7,
-            label="1 EH = 0.01 AU",
+            label="1 EH = 1.496 million km",
         )
         ax.add_patch(circle)
 
     if overlay_halo:
         ax.plot(
-            [0.01, 0.01],
-            [-HALO_Y_RADIUS_AU, HALO_Y_RADIUS_AU],
+            [ONE_EH_MILLION_KM, ONE_EH_MILLION_KM],
+            [
+                -HALO_Y_RADIUS_MILLION_KM,
+                HALO_Y_RADIUS_MILLION_KM,
+            ],
             color="magenta",
             linestyle="-",
             linewidth=2.0,
@@ -579,21 +746,21 @@ def add_common_yz_overlays(
     if overlay_1eh:
         circle = Circle(
             (0.0, 0.0),
-            ONE_EH_AU,
+            ONE_EH_MILLION_KM,
             fill=False,
             color="cyan",
             linestyle="--",
             linewidth=1.5,
             zorder=7,
-            label="1 EH = 0.01 AU",
+            label="1 EH = 1.496 million km",
         )
         ax.add_patch(circle)
 
     if overlay_halo:
         ellipse = Ellipse(
             (0.0, 0.0),
-            width=2.0 * HALO_Y_RADIUS_AU,
-            height=2.0 * HALO_Z_RADIUS_AU,
+            width=2.0 * HALO_Y_RADIUS_MILLION_KM,
+            height=2.0 * HALO_Z_RADIUS_MILLION_KM,
             fill=False,
             color="magenta",
             linestyle="-",
@@ -612,8 +779,8 @@ def overlay_real_tbos_xy(ax, real_overlay, max_labelled: int = 5):
         label = "Real TBO trajectories" if k == 0 else None
 
         ax.plot(
-            obj["x"],
-            obj["y"],
+            obj["x"] * AU_TO_MILLION_KM,
+            obj["y"] * AU_TO_MILLION_KM,
             color="grey",
             linewidth=1.2,
             alpha=0.9,
@@ -633,8 +800,8 @@ def overlay_real_tbos_xy(ax, real_overlay, max_labelled: int = 5):
 
         if k < max_labelled:
             ax.text(
-                obj["x"][0],
-                obj["y"][0],
+                obj["x"][0] * AU_TO_MILLION_KM,
+                obj["y"][0] * AU_TO_MILLION_KM,
                 f" {obj['object_id']}",
                 color="grey",
                 fontsize=8,
@@ -650,8 +817,8 @@ def overlay_real_tbos_yz(ax, real_overlay, max_labelled: int = 5):
         label = "Real TBO trajectories" if k == 0 else None
 
         ax.plot(
-            obj["y"],
-            obj["z"],
+            obj["y"] * AU_TO_MILLION_KM,
+            obj["z"] * AU_TO_MILLION_KM,
             color="white",
             linewidth=1.2,
             alpha=0.9,
@@ -660,8 +827,8 @@ def overlay_real_tbos_yz(ax, real_overlay, max_labelled: int = 5):
         )
 
         ax.scatter(
-            obj["y"][0],
-            obj["z"][0],
+            obj["y"][0] * AU_TO_MILLION_KM,
+            obj["z"][0] * AU_TO_MILLION_KM,
             s=20,
             color="white",
             edgecolors="black",
@@ -671,8 +838,8 @@ def overlay_real_tbos_yz(ax, real_overlay, max_labelled: int = 5):
 
         if k < max_labelled:
             ax.text(
-                obj["y"][0],
-                obj["z"][0],
+                obj["y"][0] * AU_TO_MILLION_KM,
+                obj["z"][0] * AU_TO_MILLION_KM,
                 f" {obj['object_id']}",
                 color="white",
                 fontsize=8,
@@ -717,7 +884,17 @@ def plot_residence_contour(
 
     x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
     y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
-    Xc, Yc = np.meshgrid(x_centers, y_centers, indexing="xy")
+
+    # The stored histogram coordinates remain in AU, but the figures are
+    # displayed in millions of kilometres for easier physical interpretation.
+    x_centers_plot = x_centers * AU_TO_MILLION_KM
+    y_centers_plot = y_centers * AU_TO_MILLION_KM
+
+    Xc, Yc = np.meshgrid(
+        x_centers_plot,
+        y_centers_plot,
+        indexing="xy",
+    )
 
     if vmax is None:
         vmax = np.nanmax(Z_plot)
@@ -789,7 +966,7 @@ if __name__ == "__main__":
     #   "plot_from_grid"
     #       Skip trajectory processing and regenerate figures from the saved
     #       grid CSVs. Real overlays can still be loaded separately.
-    RUN_MODE = "plot_from_grid"
+    RUN_MODE = "accumulate_and_plot"
 
     # ------------------------------------------------------------
     # Paths
@@ -807,6 +984,7 @@ if __name__ == "__main__":
 
     XY_GRID_CSV = OUTPUT_DIR / "xy_synthetic_residence_grid.csv"
     YZ_GRID_CSV = OUTPUT_DIR / "yz_synthetic_residence_grid.csv"
+    XYZ_GRID_CSV = OUTPUT_DIR / "xyz_synthetic_residence_grid_sparse.csv"
 
     # ------------------------------------------------------------
     # Column names
@@ -851,6 +1029,14 @@ if __name__ == "__main__":
     x_edges = np.linspace(X_MIN, X_MAX, NX + 1)
     y_edges = np.linspace(Y_MIN, Y_MAX, NY + 1)
     z_edges = np.linspace(Z_MIN, Z_MAX, NZ + 1)
+
+    # The 3D array contains NX * NY * NZ cells. With the default 300^3 grid,
+    # the in-memory float64 array requires approximately 216 MB. The output CSV
+    # is written sparsely, so only cells with residence time above the selected
+    # threshold are included.
+    ACCUMULATE_3D_GRID = True
+    THREE_D_CSV_COORDINATE_UNIT = "km"  # Options: "km" or "au"
+    THREE_D_MIN_RESIDENCE_TIME_DAYS = 0.0
 
     # ------------------------------------------------------------
     # Overlay options
@@ -897,10 +1083,12 @@ if __name__ == "__main__":
             overlay_real_tbos=OVERLAY_REAL_TBOS,
             real_overlay_max_points_per_object=REAL_OVERLAY_MAX_POINTS_PER_OBJECT,
             exclude_file_keywords=EXCLUDE_FILE_KEYWORDS,
+            accumulate_3d=ACCUMULATE_3D_GRID,
         )
 
         H_xy = result["H_xy"]
         H_yz = result["H_yz"]
+        H_xyz = result["H_xyz"]
         real_overlay = result["real_overlay"]
 
         print("\nAccumulation complete")
@@ -930,8 +1118,26 @@ if __name__ == "__main__":
             output_csv=YZ_GRID_CSV,
         )
 
+        if H_xyz is not None:
+            n_xyz_rows = save_sparse_histogram_3d_csv(
+                H_xyz=H_xyz,
+                x_edges=x_edges,
+                y_edges=y_edges,
+                z_edges=z_edges,
+                output_csv=XYZ_GRID_CSV,
+                coordinate_unit=THREE_D_CSV_COORDINATE_UNIT,
+                min_residence_time_days=THREE_D_MIN_RESIDENCE_TIME_DAYS,
+            )
+        else:
+            n_xyz_rows = 0
+
         print(f"Wrote {XY_GRID_CSV}")
         print(f"Wrote {YZ_GRID_CSV}")
+        if H_xyz is not None:
+            print(
+                f"Wrote {XYZ_GRID_CSV} "
+                f"({n_xyz_rows:,} nonzero 3D cells)"
+            )
 
     elif RUN_MODE == "plot_from_grid":
 
@@ -998,10 +1204,10 @@ if __name__ == "__main__":
         H=H_xy,
         x_edges=x_edges,
         y_edges=y_edges,
-        xlabel="Synodic x (AU)",
-        ylabel="Synodic y (AU)",
+        xlabel=r"Synodic x ($10^6$ km)",
+        ylabel=r"Synodic y ($10^6$ km)",
         title="Synthetic TBO Residence Time Distribution, XY Projection",
-        output_path=OUTPUT_DIR / "xy_synthetic_residence_time_with_overlays.png",
+        output_path=OUTPUT_DIR / "xy_synthetic_residence_time_with_overlays.svg",
         projection="xy",
         real_overlay=real_overlay,
         overlay_real=OVERLAY_REAL_TBOS,
@@ -1019,10 +1225,10 @@ if __name__ == "__main__":
         H=H_yz,
         x_edges=y_edges,
         y_edges=z_edges,
-        xlabel="Synodic y (AU)",
-        ylabel="Synodic z (AU)",
+        xlabel=r"Synodic y ($10^6$ km)",
+        ylabel=r"Synodic z ($10^6$ km)",
         title="Synthetic TBO Residence Time Distribution, YZ Projection",
-        output_path=OUTPUT_DIR / "yz_synthetic_residence_time_with_overlays.png",
+        output_path=OUTPUT_DIR / "yz_synthetic_residence_time_with_overlays.svg",
         projection="yz",
         real_overlay=real_overlay,
         overlay_real=OVERLAY_REAL_TBOS,
@@ -1033,6 +1239,10 @@ if __name__ == "__main__":
     )
 
     print(f"\nWrote plots to: {OUTPUT_DIR}")
-    print(f"1 EH radius: {ONE_EH_AU:.5f} AU")
-    print(f"Halo y-radius: {HALO_Y_RADIUS_AU:.6f} AU")
-    print(f"Halo z-radius: {HALO_Z_RADIUS_AU:.6f} AU")
+    print(f"1 EH radius: {ONE_EH_MILLION_KM:.6f} million km")
+    print(
+        f"Halo y-radius: {HALO_Y_RADIUS_MILLION_KM:.6f} million km"
+    )
+    print(
+        f"Halo z-radius: {HALO_Z_RADIUS_MILLION_KM:.6f} million km"
+    )
