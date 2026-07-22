@@ -1,0 +1,576 @@
+# ==============================================================================
+# quasi_halo_deployment_config.yaml
+# ------------------------------------------------------------------------------
+# Configuration for optimize_quasi_halo_deployment_mpi.py.
+#
+# Run with, for example:
+#   mpiexec -n 8 python optimize_quasi_halo_deployment_mpi.py \
+#       quasi_halo_deployment_config.yaml
+#
+# External project modules expected by the script:
+#   - n_body_integrator.py, containing NBodyPropagator
+#   - utilities.py, containing the supplied EME/ECLIP/SECR conversions
+#
+# Main run modes:
+#   nominal_sweep
+#     Runs all requested phase separations. For every phase it derives the fixed
+#     acquisition epoch, sweeps wait time after commissioning, performs the
+#     five-variable optimization [alpha, beta, dV1_x, dV1_y, dV1_z], derives dV2,
+#     and saves one selected nominal result per phase.
+#
+#   dispersion
+#     Loads exactly one row from a completed nominal master CSV, holds its
+#     nominal phase, separation direction and wait policy fixed, and runs the
+#     requested Monte Carlo sample count. Percentiles are calculated only within
+#     that one dispersion run.
+# ==============================================================================
+
+run:
+  mode: "nominal_sweep"  # "nominal_sweep" or "dispersion"
+
+
+# ==============================================================================
+# MPI, walltime, and per-case timeout
+# ==============================================================================
+mpi:
+  progress_every: 1
+  save_rank_outputs: true
+
+runtime:
+  # Set to null to disable the scheduler walltime stop check.
+  walltime_hours: 72.0
+  save_before_walltime_minutes: 45.0
+
+  # Applies to one phase/wait case in nominal mode or one Monte Carlo case in
+  # dispersion mode. Checked between objective/residual evaluations.
+  max_optimization_minutes: 30.0
+
+
+# ==============================================================================
+# SPICE and files
+# ==============================================================================
+spice:
+  kernels:
+    - "naif0012.tls"
+    - "de430.bsp"
+
+files:
+  constants_yaml: "constants.yaml"
+  lpf_orbit_csv: "LPF_orbit_2.csv"
+
+
+# ==============================================================================
+# LPF quasi-halo reference orbit
+# ------------------------------------------------------------------------------
+# The end index is included. The script assigns:
+#   phase(index 140000) = 0 rad
+#   phase(index 247500) = 2*pi rad
+# No phase wrapping or endpoint refinement is performed.
+#
+# The Time values are treated as UTC, e.g.
+#   2015-12-03 04:45:42.081531370
+# ==============================================================================
+reference_orbit:
+  time_column: "Time"
+  time_scale: "UTC"
+
+  quasi_halo_start: 140000
+  quasi_halo_one_period_end: 247500
+  period_end_inclusive: true
+
+  phase_start_rad: 0.0
+  phase_end_rad: 6.283185307179586
+  allow_phase_wrapping: false
+
+  state_columns_geo_eme:
+    - "GEO_EME_X_(km)"
+    - "GEO_EME_Y_(km)"
+    - "GEO_EME_Z_(km)"
+    - "GEO_EME_Vx_(km/s)"
+    - "GEO_EME_Vy_(km/s)"
+    - "GEO_EME_Vz_(km/s)"
+
+
+target_generation:
+  # Runs the EME -> ECLIP -> SECR -> ECLIP -> EME checks at phase zero and
+  # at the acquisition epoch (equivalent to a zero relative phase offset).
+  validate_frame_conversion: true
+
+
+# ==============================================================================
+# Desired phase separations
+# ------------------------------------------------------------------------------
+# Positive means the mothership is ahead of the microsatellite at acquisition.
+# The microsatellite target remains the future EME representation of rotating-
+# frame phase zero. Therefore:
+#
+#   total deployment-to-acquisition duration = phase/(2*pi) * reference period
+#   post-commissioning available time         = total duration - commissioning
+#
+# Units: "rad", "deg", or "fraction".
+# ==============================================================================
+phase_sweep:
+  enabled: true
+  require_within_one_period: true
+
+  desired_separations:
+    mode: "explicit_values"  # "explicit_values" or "linspace"
+    unit: "deg"
+    convention: "mothership_ahead_positive"
+
+    values:
+      - 10.0
+
+    # Used only for mode: "linspace"
+    start: 10.0
+    stop: 90.0
+    count: 9
+
+
+# ==============================================================================
+# Commissioning duration
+# ------------------------------------------------------------------------------
+# Nominal mode uses nominal_duration_days exactly.
+# In dispersion mode, optional duration uncertainty changes the actual first-
+# burn epoch while the nominal acquisition epoch remains fixed.
+# ==============================================================================
+commissioning:
+  nominal_duration_days: 3.0
+
+  duration_dispersion:
+    enabled: false
+    distribution: "truncated_normal"  # "normal", "truncated_normal", "uniform"
+    sigma_hours: 2.0
+    half_width_hours: 4.0              # used only by uniform
+    minimum_duration_days: 0.0
+    maximum_duration_days: 7.0
+
+
+# ==============================================================================
+# Wait time after commissioning
+# ------------------------------------------------------------------------------
+# For each desired phase, the script computes:
+#
+#   physical maximum wait = available post-commissioning time
+#                           - minimum_post_burn_coast_days
+#
+# The coarse sweep is evenly spaced. A second MPI sweep refines the neighbourhood
+# of the lowest-dV successful coarse point.
+# ==============================================================================
+wait_time_sweep:
+  enabled: False
+
+  # "fraction_of_available_time" is recommended when several phase separations
+  # have substantially different total durations.
+  bound_mode: "fraction_of_available_time"
+
+  minimum_fraction: 0.0
+  maximum_fraction: 1.0
+  number_of_samples: 1
+
+  # Used only for bound_mode: "absolute_days". The configured maximum is clipped
+  # to the physical maximum available for each phase.
+  minimum_wait_days: 0.0
+  maximum_wait_days: 30.0
+
+  minimum_post_burn_coast_days: 1.0  # to ensure that the two burns don't happen too close to each other
+
+  refinement:  # run a refinement of wait time to go from coarse to fine
+    enabled: false
+    number_of_samples: 11
+    number_of_neighbour_intervals: 1
+
+
+# ==============================================================================
+# Separation mechanism and direction definition
+# ------------------------------------------------------------------------------
+# Separation speed is fixed during the nominal five-variable optimization, so
+# the optimizer cannot allocate extra ejector dV. It optimizes only direction.
+#
+# The local frame columns are [tangent, cross, normal]:
+#   tangent = normalized rotating-frame quasi-halo velocity
+#   normal  = normalized r x v
+#   cross   = normal x tangent
+#
+# alpha=0, beta=0 points along positive tangent.
+# ==============================================================================
+separation:
+  # Fixed magnitude of the nominal deployment impulse provided by the
+  # separation mechanism. The optimizer changes only its direction, not
+  # its magnitude, so it cannot assign extra separation ΔV.
+  fixed_nominal_speed_mps: 1.0
+
+  # Coordinate frame in which the separation azimuth and elevation are defined.
+  # "local_quasi_halo" uses the local tangent, cross-track, and normal directions
+  # constructed from the quasi-halo position and velocity at deployment.
+  direction_frame: "local_quasi_halo"
+
+  # Epoch used to construct the local quasi-halo basis in dispersed cases.
+  #
+  # "actual_deployment":
+  #   Recompute the local tangent/cross/normal frame at each case's dispersed
+  #   deployment epoch. This captures the change in local orbit orientation
+  #   caused by deployment-timing uncertainty.
+  #
+  # "nominal_deployment":
+  #   Use the same local frame computed at the nominal deployment epoch for
+  #   every case. This treats the commanded inertial deployment direction as
+  #   fixed relative to the nominal deployment geometry.
+  direction_frame_epoch: "actual_deployment"  # or "nominal_deployment"
+
+  # Indicates that the mothership attitude may be selected freely so that the
+  # deployer can realize any optimized separation direction allowed by the
+  # azimuth and elevation bounds. This is currently descriptive metadata; the
+  # optimizer already uses the configured angular bounds as the actual limits.
+  mothership_can_reorient_arbitrarily: true
+
+  azimuth_bounds_deg:
+    #min: -180.0
+    #max: 180.0
+    min: 0.0
+    max: 0.0
+
+  # Avoid the exact spherical-coordinate singularity at +/-90 degrees.
+  elevation_bounds_deg:
+    #min: -89.999
+    #max: 89.999
+    min: -0.0
+    max: 0.0
+
+# ==============================================================================
+# Nominal five-variable optimization
+# ------------------------------------------------------------------------------
+# Variables:
+#   [separation azimuth, separation elevation, dV1_x, dV1_y, dV1_z]
+#
+# Objective:
+#   ||dV1|| + ||dV2||
+#
+# Equality constraint:
+#   acquisition position - target position = 0
+#
+# dV2 is derived from the acquisition velocity mismatch.
+# ==============================================================================
+nominal_optimization:
+  method: "SLSQP"
+
+  # When both azimuth and elevation bounds have zero width, solve only the
+  # three dV1 components with bounded least squares. This skips the redundant
+  # five-variable SLSQP pass and caches the identical pre-burn coast.
+  fixed_angle_fast_path: false
+
+  dv1_initial_guess_mps:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+
+  dv1_component_bound_mps: 100.0
+
+  # Optional norm limits. Set null to disable.
+  dv1_max_mps: null
+  dv2_max_mps: null
+
+  position_constraint_scale_km: 1000.0
+  position_success_tolerance_km: 1.0
+  velocity_success_tolerance_mps: 0.001
+
+  objective_velocity_smoothing_mps: 1.0e-9
+  max_iterations: 500
+  ftol: 1.0e-2
+
+  # Before each SLSQP start, solve a fixed-angle 3-variable position-targeting
+  # problem to produce a more feasible dV1 initial guess.
+  pretarget_dv1: true
+  pretarget_max_nfev: 50
+  pretarget_xtol: 1.0e-2
+  pretarget_ftol: 1.0e-2
+  pretarget_gtol: 1.0e-2
+
+multistart:
+  # Seed used to generate the random initial guesses. Keeping this fixed makes
+  # the multistart optimization reproducible between runs.
+  random_seed: 1
+
+  # Number of additional initial guesses generated with random separation
+  # azimuth and elevation values within their configured bounds.
+  #
+  # Each random angular start is combined with an initial first-burn guess and
+  # passed to the optimizer independently. The lowest-ΔV successful solution
+  # among all starts is retained.
+  n_random_starts: 0
+
+  # Physically interpretable separation directions that are always tested in
+  # addition to the random starts. Angles are defined in the configured
+  # separation direction frame, here the local quasi-halo frame.
+  #
+  # With the local basis ordered as tangent, cross-track, and normal:
+  #   azimuth =   0°, elevation =  0°  -> positive tangent
+  #   azimuth = 180°, elevation =  0°  -> negative tangent
+  #   azimuth =  90°, elevation =  0°  -> positive cross-track
+  #   azimuth = -90°, elevation =  0°  -> negative cross-track
+  #   azimuth =   0°, elevation = 45°  -> between positive tangent and normal
+  #   azimuth =   0°, elevation = -45° -> between positive tangent and
+  #                                        negative normal
+  #
+  # These starts improve the chance of finding different local solution
+  # branches and reduce dependence on one arbitrary initial direction.
+  explicit_angle_starts_deg:
+    - {azimuth: 0.0, elevation: 0.0}
+    #- {azimuth: 180.0, elevation: 0.0}
+    #- {azimuth: 90.0, elevation: 0.0}
+    #- {azimuth: -90.0, elevation: 0.0}
+    #- {azimuth: 0.0, elevation: 45.0}
+    #- {azimuth: 0.0, elevation: -45.0}
+
+
+# ==============================================================================
+# N-body propagation
+# ==============================================================================
+propagation:
+  frame: "J2000"
+  origin: "399"
+  method: "DOP853"
+  rtol: 1.0e-10
+  atol: 1.0e-12
+
+  bodies:
+    - "10"     # Sun
+    - "1"      # Mercury barycenter
+    - "2"      # Venus barycenter
+    - "399"    # Earth
+    - "4"      # Mars barycenter
+    - "5"      # Jupiter barycenter
+    - "6"      # Saturn barycenter
+    - "7"      # Uranus barycenter
+    - "8"      # Neptune barycenter
+    - "301"    # Moon
+
+
+# ==============================================================================
+# Source nominal result used only when run.mode = "dispersion"
+# ------------------------------------------------------------------------------
+# One dispersion invocation corresponds to one fixed nominal phase result.
+# Percentiles are calculated only across that run's x samples.
+# ==============================================================================
+dispersion_source_nominal:
+  nominal_master_csv: "results/deployment_nominal/nominal_separation_sweep_summary.csv"
+
+  selection_mode: "separation_id"  # "separation_id", "phase_deg", "row_index"
+  separation_id: "sep_002_0030.0000deg"
+
+  phase_deg: 30.0
+  phase_tolerance_deg: 1.0e-6
+  row_index: 0
+
+  require_target_success: true
+
+
+# ==============================================================================
+# Dispersion sources
+# ------------------------------------------------------------------------------
+# Every source has an enabled toggle. The default configuration represents the
+# Level-1 physical deployment-dispersion analysis: truth is known perfectly at
+# the burns and maneuver execution is perfect. Navigation and execution blocks
+# are included for optional higher-fidelity sensitivity studies.
+#
+# clip_sigma applies to standard-normal draws. Set null for untruncated normals.
+# ==============================================================================
+dispersion:
+  enabled: true
+  n_samples: 1000
+  random_seed: 1
+  clip_sigma: 3.0
+
+  deployment_timing:
+    enabled: true
+    distribution: "normal"
+    sigma_s: 1.0
+
+  mothership_state:
+    enabled: true
+    frame: "geo_eme"
+
+    # A 6x6 CSV/NPY covariance overrides the component sigmas when provided.
+    covariance_file: null
+
+    position_sigma_km:
+      x: 1.0
+      y: 1.0
+      z: 1.0
+
+    velocity_sigma_mps:
+      x: 0.01
+      y: 0.01
+      z: 0.01
+
+  separation_position:
+    enabled: false
+    frame: "local_quasi_halo"
+    sigma_km:
+      tangent: 0.0
+      cross: 0.0
+      normal: 0.0
+
+  separation_speed:
+    enabled: true
+    distribution: "normal"
+    sigma_mps: 0.05
+    prevent_negative_speed: true
+
+  separation_direction:
+    enabled: true
+    model: "azimuth_elevation"
+    azimuth_sigma_deg: 0.1
+    elevation_sigma_deg: 0.1
+
+  # Optional translational coupling v = omega x r. Tip-off is not otherwise
+  # added directly to the centre-of-mass trajectory.
+  lever_arm:
+    enabled: false
+
+    position_body_m:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+    tipoff_rate_sigma_deg_s:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+  # Optional navigation error at the first correction burn. The command is
+  # solved using the estimated state and then applied to the truth trajectory.
+  navigation_at_first_burn:
+    enabled: false
+    frame: "geo_eme"
+    covariance_file: null
+
+    position_sigma_km:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+    velocity_sigma_mps:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+  # Optional acquisition-state navigation error used to calculate dV2.
+  navigation_at_acquisition:
+    enabled: false
+    frame: "geo_eme"
+    covariance_file: null
+
+    position_sigma_km:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+    velocity_sigma_mps:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+  first_burn_execution:
+    enabled: false
+    magnitude_sigma_fraction: 0.0
+    pointing_sigma_deg: 0.0
+    timing_sigma_s: 0.0
+
+  acquisition_burn_execution:
+    enabled: false
+    magnitude_sigma_fraction: 0.0
+    pointing_sigma_deg: 0.0
+    timing_sigma_s: 0.0
+
+
+# ==============================================================================
+# Per-dispersion-case correction targeting
+# ------------------------------------------------------------------------------
+# The nominal separation angles are dispersed but not reoptimized. Only dV1 is
+# solved per case; dV2 is derived.
+# ==============================================================================
+dispersion_optimization:
+  correction_timing_mode: "fixed_wait_after_commissioning"
+  # Alternative: "fixed_absolute_epoch"
+
+  dv1_component_bound_mps: 100.0
+  position_constraint_scale_km: 1000.0
+
+  max_nfev: 300
+  xtol: 1.0e-10
+  ftol: 1.0e-10
+  gtol: 1.0e-10
+
+  position_success_tolerance_km: 1.0
+  velocity_success_tolerance_mps: 0.001
+
+
+# ==============================================================================
+# Outputs
+# ------------------------------------------------------------------------------
+# Use a different output_dir for nominal and dispersion invocations.
+# All generated plots are SVG by default. Dimensions and font size are globally
+# configurable below.
+# ==============================================================================
+output:
+  output_dir: "results/deployment_nominal"
+
+  nominal:
+    master_filename: "nominal_separation_sweep_summary.csv"
+    wait_master_filename: "nominal_wait_sweep_master.csv"
+    save_all_trajectory_bundles: true
+    save_maneuver_files: true
+
+  dispersion:
+    master_filename: "deployment_dispersion_master.csv"
+    statistics_filename: "dispersion_statistics.csv"
+
+    # Usually use commanded total corrective dV. For execution studies this can
+    # be changed to dv_total_executed_mps.
+    percentile_metric: "dv_total_mps"
+
+    save_all_case_trajectories: false
+    save_representative_trajectories: true
+    representative_percentiles:
+      - 0
+      - 50
+      - 95
+      - 99
+      - 100
+
+  trajectories:
+    step_days: 0.05
+    include_mothership_reference: true
+    include_microsat_phase_reference: true
+    include_microsat_actual_state: true
+    include_relative_state: true
+
+  metadata:
+    save_json: true
+    filename: "run_metadata.json"
+
+    save_resolved_config: true
+    resolved_config_filename: "resolved_config.yaml"
+
+
+# ==============================================================================
+# Plot settings
+# ==============================================================================
+plots:
+  enabled: true
+  format: "svg"
+
+  figure_size_inches:
+    width: 6.0
+    height: 6.0
+
+  font_size: 12
+
+  save_wait_time_trade_curves: true
+  save_nominal_dv_vs_phase: true
+  save_dispersion_histogram: true
+  save_dispersion_cdf: true
+  save_burn_component_distributions: true
+  save_representative_trajectory_plots: false
+  show: false
