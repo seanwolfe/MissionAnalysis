@@ -1,0 +1,255 @@
+# ==============================================================================
+# deployment_recovery_dispersion_config.yaml
+# ------------------------------------------------------------------------------
+# Configuration for deployment_recovery_dispersion_mpi.py
+#
+# Physical sequence for every realization:
+#
+#   LPF reference state at deployment
+#       -> dispersed separation impulse
+#       -> fixed commissioning coast
+#       -> burn 1 immediately after commissioning
+#       -> candidate recovery coast
+#       -> burn 2 at capture
+#       -> match the LPF position and velocity at that same capture epoch
+#
+# Only separation azimuth, elevation, and speed magnitude are dispersed.
+# For every fixed recovery duration, six burn components are optimized against
+# six final-state residuals. The optimizer-successful duration with the lowest
+# total recovery Delta-V is retained.
+#
+# Example:
+#   mpiexec -n 8 python deployment_recovery_dispersion_mpi.py \
+#       deployment_recovery_dispersion_config.yaml
+# ==============================================================================
+
+
+# ==============================================================================
+# MPI AND RUNTIME
+# ==============================================================================
+mpi:
+  progress_every: 11
+  rank_progress: true
+  save_rank_outputs: true
+  rank_output_subdir: "rank_outputs"
+  save_every_samples: 5
+
+runtime:
+  walltime_hours: 72.0
+  save_before_walltime_minutes: 45.0
+
+  # Applies to one complete dispersion realization, including every candidate
+  # recovery duration evaluated for that realization.
+  max_sample_minutes: 60.0
+
+
+# ==============================================================================
+# SPICE AND FILES
+# ==============================================================================
+spice:
+  kernels:
+    - "naif0012.tls"
+    - "de430.bsp"
+
+files:
+  constants_yaml: "constants.yaml"
+  lpf_orbit_csv: "LPF_orbit_2.csv"
+  output_dir: "results\\deployment_recovery_dispersion"
+
+
+# ==============================================================================
+# LPF REFERENCE TRAJECTORY
+# ------------------------------------------------------------------------------
+# The time-tagged LPF state at each candidate capture epoch is the recovery
+# target. No SECR phase-point reconstruction is used.
+# ==============================================================================
+reference_orbit:
+  time_column: "Time"
+
+  quasi_halo_start: 140000
+  quasi_halo_one_period_end: 247500
+  period_end_inclusive: true
+
+  state_columns_geo_eme:
+    - "GEO_EME_X_(km)"
+    - "GEO_EME_Y_(km)"
+    - "GEO_EME_Z_(km)"
+    - "GEO_EME_Vx_(km/s)"
+    - "GEO_EME_Vy_(km/s)"
+    - "GEO_EME_Vz_(km/s)"
+
+
+deployment:
+  nominal_deployment_index: 140000
+
+
+# ==============================================================================
+# NOMINAL SEPARATION
+# ------------------------------------------------------------------------------
+# Angles are defined in the local quasi-halo basis at deployment:
+#   azimuth = 0 deg: +tangent
+#   azimuth = 90 deg: +cross-track
+#   elevation = +90 deg: +normal
+# ==============================================================================
+separation:
+  nominal_azimuth_deg: 0.0
+  nominal_elevation_deg: 0.0
+  nominal_speed_mps: 1.0
+  direction_frame: "local_quasi_halo"
+
+
+# ==============================================================================
+# DISPERSIONS
+# ------------------------------------------------------------------------------
+# Supported distributions:
+#   normal:  mean, sigma, optional clip_sigma
+#   uniform: min/max or half_range
+#
+# clip_sigma clips generated normal values; it is not rejection sampling.
+# The nominal case is saved as sample_id=0 when enabled.
+# ==============================================================================
+dispersion:
+  n_random_samples: 2
+  include_nominal_case: true
+  random_seed: 42
+
+  minimum_allowed_speed_mps: 0.0
+
+  azimuth_error_deg:
+    distribution: "normal"
+    mean: 0.0
+    sigma: 1.0
+    clip_sigma: 3.0
+
+  elevation_error_deg:
+    distribution: "normal"
+    mean: 0.0
+    sigma: 1.0
+    clip_sigma: 3.0
+
+  separation_speed_error_mps:
+    distribution: "normal"
+    mean: 0.0
+    sigma: 0.05
+    clip_sigma: 3.0
+
+
+# ==============================================================================
+# COMMISSIONING AND RECOVERY-TIME SEARCH
+# ------------------------------------------------------------------------------
+# Burn 1 is applied immediately after commissioning. Each listed transfer time
+# defines a capture epoch:
+#
+#   t_capture = t_deployment + commissioning_duration_days + transfer_days
+#
+# The target is the interpolated LPF six-state at t_capture.
+# ==============================================================================
+recovery:
+  commissioning_duration_days: 5.0
+
+  transfer_time_grid:
+    mode: "linspace"  # "linspace" or "explicit"
+
+    minimum_days: 0.5
+    maximum_days: 30.0
+    number_of_times: 5
+
+    # Used only when mode is "explicit".
+    values_days:
+      - 0.5
+      - 1.0
+      - 2.0
+      - 5.0
+      - 10.0
+      - 20.0
+      - 30.0
+
+
+# ==============================================================================
+# SIX-VARIABLE TWO-BURN OPTIMIZATION
+# ------------------------------------------------------------------------------
+# Variables:
+#   [dv1_x, dv1_y, dv1_z, dv2_x, dv2_y, dv2_z]
+#
+# Residuals:
+#   [dr_x/r_scale, dr_y/r_scale, dr_z/r_scale,
+#    dv_x/v_scale, dv_y/v_scale, dv_z/v_scale]
+#
+# There is no Delta-V penalty and no separate target-success Boolean. Total
+# Delta-V and final physical errors are recorded for every transfer duration.
+# ==============================================================================
+optimization:
+  first_burn_component_bound_mps: 100.0
+  second_burn_component_bound_mps: 100.0
+
+  # "ballistic_informed", "zero", or "configured".
+  initial_guess_mode: "ballistic_informed"
+  first_burn_initial_guess_mps: [0.0, 0.0, 0.0]
+  second_burn_initial_guess_mps: [0.0, 0.0, 0.0]
+
+  r_scale_km: 1000000.0
+  v_scale_kms: 1.0
+
+  method: "trf"
+  max_nfev: 300
+  xtol: 1.0e-10
+  ftol: 1.0e-10
+  gtol: 1.0e-10
+
+
+# ==============================================================================
+# N-BODY PROPAGATION
+# ==============================================================================
+propagation:
+  frame: "J2000"
+  origin: "399"
+  method: "DOP853"
+  rtol: 1.0e-10
+  atol: 1.0e-12
+
+  bodies:
+    - "10"     # Sun
+    - "1"      # Mercury barycenter
+    - "2"      # Venus barycenter
+    - "399"    # Earth
+    - "4"      # Mars barycenter
+    - "5"      # Jupiter barycenter
+    - "6"      # Saturn barycenter
+    - "7"      # Uranus barycenter
+    - "8"      # Neptune barycenter
+    - "301"    # Moon
+
+
+# ==============================================================================
+# OUTPUTS
+# ==============================================================================
+output:
+  save_all_recovery_trials: true
+
+  save_representative_trajectories: true
+  representative_dv_percentiles:
+    - 0
+    - 50
+    - 95
+    - 100
+
+  trajectory_step_days: 0.05
+
+
+# ==============================================================================
+# PLOTS
+# ------------------------------------------------------------------------------
+# show_plots is the global interactive-display switch. Keep false for MPI/HPC.
+# ==============================================================================
+plots:
+  enabled: true
+  show_plots: false
+  format: "svg"
+
+  figure_size_inches:
+    width: 6.0
+    height: 6.0
+
+  font_size: 12
+  histogram_bins: 30
+  save_representative_trajectories: true
