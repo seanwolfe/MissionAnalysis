@@ -28,7 +28,7 @@
 # MPI AND RUNTIME
 # ==============================================================================
 mpi:
-  progress_every: 11
+  progress_every: 1
   rank_progress: true
   save_rank_outputs: true
   rank_output_subdir: "rank_outputs"
@@ -40,7 +40,7 @@ runtime:
 
   # Applies to one complete dispersion realization, including every candidate
   # recovery duration evaluated for that realization.
-  max_sample_minutes: 60.0
+  max_sample_minutes: 720.0
 
 
 # ==============================================================================
@@ -109,7 +109,7 @@ separation:
 # The nominal case is saved as sample_id=0 when enabled.
 # ==============================================================================
 dispersion:
-  n_random_samples: 2
+  n_random_samples: 100
   include_nominal_case: true
   random_seed: 42
 
@@ -118,19 +118,19 @@ dispersion:
   azimuth_error_deg:
     distribution: "normal"
     mean: 0.0
-    sigma: 1.0
+    sigma: 5.0
     clip_sigma: 3.0
 
   elevation_error_deg:
     distribution: "normal"
     mean: 0.0
-    sigma: 1.0
+    sigma: 5.0
     clip_sigma: 3.0
 
   separation_speed_error_mps:
     distribution: "normal"
     mean: 0.0
-    sigma: 0.05
+    sigma: 1.0
     clip_sigma: 3.0
 
 
@@ -148,10 +148,10 @@ recovery:
   commissioning_duration_days: 5.0
 
   transfer_time_grid:
-    mode: "linspace"  # "linspace" or "explicit"
+    mode: "explicit"  # "linspace" or "explicit"
 
     minimum_days: 0.5
-    maximum_days: 30.0
+    maximum_days: 179.0
     number_of_times: 5
 
     # Used only when mode is "explicit".
@@ -163,6 +163,11 @@ recovery:
       - 10.0
       - 20.0
       - 30.0
+      - 60.0
+      - 90.0
+      - 120.0
+      - 150.0
+      - 170.0
 
 
 # ==============================================================================

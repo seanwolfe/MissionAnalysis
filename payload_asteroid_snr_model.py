@@ -2007,6 +2007,7 @@ if __name__ == "__main__":
     # in one Earth-centred inertial frame for illustration. The origin is
     # arbitrary for this model, provided every position uses the same frame.
 
+
     payload = PayloadConfig(
         exposure_time_s=30.0,
         aperture_diameter_m=0.10,

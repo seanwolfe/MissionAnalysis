@@ -83,9 +83,7 @@ from payload_asteroid_snr_model import (
     compute_asteroid_snr,
 )
 
-
 FloatArray = NDArray[np.float64]
-
 
 # =============================================================================
 # CONFIGURATION
@@ -110,26 +108,82 @@ SHOW_FIGURES = True
 VEGA_FLUX_DENSITY = 3.68e-2
 REFERENCE_WAVELENGTH_M = 0.555e-6
 
+QE_WAVELENGTH_M = np.array([
+    358.91e-9, 369.55e-9, 379.31e-9, 389.06e-9, 399.71e-9, 409.46e-9, 419.22e-9, 429.86e-9, 439.61e-9, 449.37e-9,
+    460.01e-9, 469.76e-9, 479.52e-9, 489.27e-9, 499.92e-9, 509.67e-9, 519.43e-9, 529.18e-9, 539.82e-9, 549.58e-9,
+    559.33e-9, 569.09e-9, 579.73e-9, 589.49e-9, 600.13e-9, 609.88e-9, 619.64e-9, 630.28e-9, 640.03e-9, 649.79e-9,
+    659.54e-9, 670.19e-9, 679.94e-9, 689.70e-9, 700.34e-9, 710.09e-9, 719.85e-9, 729.60e-9, 740.24e-9, 750.00e-9,
+    759.76e-9, 769.51e-9, 780.15e-9, 789.91e-9, 799.66e-9, 810.30e-9, 820.06e-9, 829.81e-9, 840.46e-9, 850.21e-9,
+    860.85e-9, 870.61e-9, 880.36e-9, 890.12e-9, 900.76e-9, 910.51e-9, 920.27e-9, 930.91e-9, 940.67e-9, 950.42e-9,
+    960.18e-9, 969.93e-9, 980.57e-9, 990.33e-9, 1000.97e-9, 1015.16e-9, 1030.24e-9, 1039.99e-9, 1055.07e-9, 1064.82e-9,
+    1075.46e-9, 1085.22e-9
+], dtype=float)
+
+QE_VALUES = np.array([
+    0.740290, 0.736752, 0.736752, 0.926036, 0.956109, 0.959647, 0.959647, 0.957878, 0.957878, 0.957878, 0.963185,
+    0.961416, 0.957878, 0.950802, 0.945495, 0.945495, 0.949033, 0.949033, 0.950802, 0.950802, 0.954340, 0.954340,
+    0.954340, 0.954340, 0.954340, 0.949033, 0.949033, 0.941957, 0.936650, 0.927805, 0.915422, 0.906577, 0.906577,
+    0.894194, 0.853507, 0.842892, 0.828740, 0.828740, 0.775670, 0.749135, 0.727907, 0.727907, 0.683682, 0.660685,
+    0.632381, 0.604077, 0.584617, 0.559851, 0.531547, 0.508550, 0.483784, 0.457249, 0.457249, 0.427176, 0.388258,
+    0.367030, 0.367030, 0.321035, 0.305114, 0.285655, 0.285655, 0.260889, 0.218433, 0.200743, 0.181284, 0.161825,
+    0.121138, 0.121138, 0.082220, 0.064529, 0.050377, 0.039763
+], dtype=float)
+
+LUMIO_WAVELENGTH_M = 1.0e-9 * np.array(
+    [
+        400.0,
+        420.0,
+        500.0,
+        600.0,
+        700.0,
+        800.0,
+        950.0,
+    ],
+    dtype=float,
+)
+
+LUMIO_THROUGHPUT_KNOTS = np.array(
+    [
+        0.05,
+        0.35,
+        0.85,
+        0.87,
+        0.94,
+        0.89,
+        0.96,
+    ],
+    dtype=float,
+)
+
+LUMIO_THROUGHPUT = np.interp(
+    QE_WAVELENGTH_M,
+    LUMIO_WAVELENGTH_M,
+    LUMIO_THROUGHPUT_KNOTS,
+    left=0.0,
+    right=0.0,
+)
+
 # Replace these preliminary values with the average/reference payload scenario.
 PAYLOAD = PayloadConfig(
     exposure_time_s=30.0,
-    aperture_diameter_m=0.30,
-    focal_length_m=0.78,
-    pixel_scale_arcsec_per_px=1.0,
-    pixel_pitch_m=3.76e-6,
-    psf_sigma_px=1.2,
+    aperture_diameter_m=0.198,
+    focal_length_m=1.586,
+    pixel_scale_arcsec_per_px=0.91,
+    pixel_pitch_m=7e-6,
+    psf_sigma_px=1.1,
 
     # Scalars are treated as constant across the wavelength band. They may be
     # replaced by one-dimensional arrays sampled on wavelength_m.
-    quantum_efficiency=0.80,
-    optical_throughput=0.80,
+    quantum_efficiency=QE_VALUES,
+    optical_throughput=LUMIO_THROUGHPUT,
+    wavelength_m=QE_WAVELENGTH_M,
 
-    dark_current_e_per_s_px=0.002,
-    read_noise_e_rms_per_px=1.2,
+    dark_current_e_per_s_px=0.069,
+    read_noise_e_rms_per_px=5,
     background_surface_brightness_mag_arcsec2=22.0,
 
-    wavelength_lower_m=400.0e-9,
-    wavelength_upper_m=800.0e-9,
+    wavelength_lower_m=None,
+    wavelength_upper_m=None,
     spectral_samples=2001,
 
     # zero_point_mag is the magnitude that produces 1 electron/s. When it is
@@ -250,6 +304,7 @@ SNR_LINE_LEVELS = (1.0, 3.0, 5.0, 10.0)
 MAKE_3D_ISOSURFACES = False
 SNR_ISOSURFACE_LEVELS = (1.0, 3.0, 5.0, 10.0)
 
+
 # =============================================================================
 
 
@@ -291,9 +346,9 @@ def validate_configuration() -> None:
         raise ValueError("PLOT_SNR_MIN must be positive when specified.")
 
     if (
-        PLOT_SNR_MIN is not None
-        and PLOT_SNR_MAX is not None
-        and PLOT_SNR_MAX <= PLOT_SNR_MIN
+            PLOT_SNR_MIN is not None
+            and PLOT_SNR_MAX is not None
+            and PLOT_SNR_MAX <= PLOT_SNR_MIN
     ):
         raise ValueError("PLOT_SNR_MAX must exceed PLOT_SNR_MIN.")
 
@@ -325,9 +380,9 @@ def make_grid_axes() -> tuple[FloatArray, FloatArray, FloatArray]:
 
 
 def flat_grid_positions(
-    x_km: FloatArray,
-    y_km: FloatArray,
-    z_km: FloatArray,
+        x_km: FloatArray,
+        y_km: FloatArray,
+        z_km: FloatArray,
 ) -> FloatArray:
     """Return all grid positions as an array with shape (n_points, 3)."""
 
@@ -395,8 +450,8 @@ def make_boresights(asteroid_positions_km: FloatArray) -> FloatArray:
         return np.broadcast_to(fixed / norm, (n_points, 3)).copy()
 
     line_of_sight = (
-        asteroid_positions_km
-        - np.asarray(OBSERVER_POSITION_KM, dtype=float)
+            asteroid_positions_km
+            - np.asarray(OBSERVER_POSITION_KM, dtype=float)
     )
     norms = np.linalg.norm(line_of_sight, axis=-1, keepdims=True)
     if np.any(norms <= 0.0):
@@ -407,7 +462,7 @@ def make_boresights(asteroid_positions_km: FloatArray) -> FloatArray:
 
 
 def evaluate_snr_grid(
-    asteroid_positions_km: FloatArray,
+        asteroid_positions_km: FloatArray,
 ) -> dict[str, FloatArray]:
     """Evaluate the SNR model on all valid grid points in chunks."""
 
@@ -438,7 +493,7 @@ def evaluate_snr_grid(
     phase_model = HG12PhaseModel.from_default_table()
 
     for start in range(0, valid_indices.size, CHUNK_SIZE):
-        selected_indices = valid_indices[start : start + CHUNK_SIZE]
+        selected_indices = valid_indices[start: start + CHUNK_SIZE]
         positions = asteroid_positions_km[selected_indices]
         n_chunk = positions.shape[0]
 
@@ -499,7 +554,7 @@ def evaluate_snr_grid(
 
 
 def reshape_outputs(
-    flat_outputs: dict[str, FloatArray],
+        flat_outputs: dict[str, FloatArray],
 ) -> dict[str, FloatArray]:
     """Reshape every flat output to GRID_SHAPE."""
 
@@ -560,13 +615,13 @@ def make_filled_levels(vmin: float, vmax: float) -> FloatArray:
 
 
 def plot_contour_slice(
-    horizontal_values: FloatArray,
-    vertical_values: FloatArray,
-    snr_slice: FloatArray,
-    horizontal_label: str,
-    vertical_label: str,
-    title: str,
-    output_name: str,
+        horizontal_values: FloatArray,
+        vertical_values: FloatArray,
+        snr_slice: FloatArray,
+        horizontal_label: str,
+        vertical_label: str,
+        title: str,
+        output_name: str,
 ) -> None:
     """Create and save one filled SNR contour figure."""
 
@@ -577,7 +632,7 @@ def plot_contour_slice(
     )
 
     values = np.asarray(snr_slice, dtype=float)
-    vmin, vmax = choose_colour_limits((0.0,5))
+    vmin, vmax = choose_colour_limits((0.0, 5))
     levels = make_filled_levels(vmin, vmax)
 
     if COLOR_SCALE == "log":
@@ -648,10 +703,10 @@ def plot_contour_slice(
 
 
 def save_grid_data(
-    x_km: FloatArray,
-    y_km: FloatArray,
-    z_km: FloatArray,
-    grids: dict[str, FloatArray],
+        x_km: FloatArray,
+        y_km: FloatArray,
+        z_km: FloatArray,
+        grids: dict[str, FloatArray],
 ) -> None:
     """Save the complete spatial grid and model results."""
 
@@ -692,11 +747,11 @@ def json_safe(value):
 
 
 def save_run_summary(
-    x_km: FloatArray,
-    y_km: FloatArray,
-    z_km: FloatArray,
-    snr_grid: FloatArray,
-    selected_indices: tuple[int, int, int],
+        x_km: FloatArray,
+        y_km: FloatArray,
+        z_km: FloatArray,
+        snr_grid: FloatArray,
+        selected_indices: tuple[int, int, int],
 ) -> None:
     """Save the adopted scenario and summary statistics as JSON."""
 
@@ -738,16 +793,16 @@ def save_run_summary(
         )
 
     with (
-        OUTPUT_DIRECTORY / f"{OUTPUT_STEM}_summary.json"
+            OUTPUT_DIRECTORY / f"{OUTPUT_STEM}_summary.json"
     ).open("w", encoding="utf-8") as file:
         json.dump(json_safe(summary), file, indent=2)
 
 
 def make_isosurface_plots(
-    x_local_scaled: FloatArray,
-    y_local_scaled: FloatArray,
-    z_local_scaled: FloatArray,
-    snr_grid: FloatArray,
+        x_local_scaled: FloatArray,
+        y_local_scaled: FloatArray,
+        z_local_scaled: FloatArray,
+        snr_grid: FloatArray,
 ) -> None:
     """Optionally create one true 3D isosurface figure per SNR level."""
 
@@ -850,7 +905,7 @@ def main() -> None:
     positions_km = flat_grid_positions(x_km, y_km, z_km)
 
     total_points = positions_km.shape[0]
-    approximate_snr_storage_mb = total_points * 8.0 / 1024.0**2
+    approximate_snr_storage_mb = total_points * 8.0 / 1024.0 ** 2
     print(f"Grid shape: {GRID_SHAPE}")
     print(f"Total grid points: {total_points:,}")
     print(
