@@ -977,7 +977,7 @@ if __name__ == "__main__":
     )
 
     OUTPUT_DIR = Path(
-        r"tbo_residence_time_results"
+        r"tbo_residence_time_results_2"
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1018,9 +1018,9 @@ if __name__ == "__main__":
     # Binning in AU
     # ------------------------------------------------------------
 
-    X_MIN, X_MAX = -0.04, 0.04
-    Y_MIN, Y_MAX = -0.04, 0.04
-    Z_MIN, Z_MAX = -0.04, 0.04
+    X_MIN, X_MAX = -0.01, 0.01
+    Y_MIN, Y_MAX = -0.01, 0.01
+    Z_MIN, Z_MAX = -0.01, 0.01
 
     NX = 300
     NY = 300
@@ -1042,7 +1042,7 @@ if __name__ == "__main__":
     # Overlay options
     # ------------------------------------------------------------
 
-    OVERLAY_REAL_TBOS = True
+    OVERLAY_REAL_TBOS = False
 
     # In plot_from_grid mode, this controls whether the script re-reads
     # only the real TBO trajectory files for overlay.

@@ -70,6 +70,7 @@ from typing import Literal
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
+from matplotlib.patches import Circle
 import numpy as np
 from numpy.typing import NDArray
 
@@ -165,7 +166,7 @@ LUMIO_THROUGHPUT = np.interp(
 
 # Replace these preliminary values with the average/reference payload scenario.
 PAYLOAD = PayloadConfig(
-    exposure_time_s=30.0,
+    exposure_time_s=65.0,
     aperture_diameter_m=0.198,
     focal_length_m=1.586,
     pixel_scale_arcsec_per_px=0.91,
@@ -205,7 +206,7 @@ PAYLOAD = PayloadConfig(
 ASTEROID = AsteroidProperties(
     absolute_magnitude=30.0,
     geometric_albedo=0.15,
-    g12=0.40,
+    g12=0.64,
 )
 
 # The average asteroid inertial velocity is also held constant throughout the
@@ -215,19 +216,19 @@ ASTEROID_VELOCITY_KM_S = np.array([0.15, 0.45, 0.02], dtype=float)
 # Optional angular-rate override. Leave as None to derive the rate from the
 # observer and asteroid relative states at each grid point. A scalar override
 # applies the same angular speed everywhere.
-ASTEROID_ANGULAR_RATE_OVERRIDE_ARCSEC_S: float | None = None
+ASTEROID_ANGULAR_RATE_OVERRIDE_ARCSEC_S = 600 / 3600
 
 # -----------------------------------------------------------------------------
 # Representative observer and environment state
 # -----------------------------------------------------------------------------
 # All positions and velocities must use the same origin, axes, frame, and
 # representative epoch. Positions are km and velocities are km/s.
-OBSERVER_POSITION_KM = np.array([-1.50e6, 8.0e5, 0.0e5], dtype=float)
+OBSERVER_POSITION_KM = np.array([-1.50e6, 8e5, 0e5], dtype=float)
 OBSERVER_VELOCITY_KM_S = np.array([0.0, -0.20, 0.0], dtype=float)
 
 SUN_POSITION_KM = np.array([-149_597_870.7, 0.0, 0.0], dtype=float)
 EARTH_POSITION_KM = np.array([0.0, 0.0, 0.0], dtype=float)
-MOON_POSITION_KM = np.array([0.0, 384_400.0, 0.0], dtype=float)
+MOON_POSITION_KM = np.array([384_400.0, 0.0, 0.0], dtype=float)
 
 ENVIRONMENT = EnvironmentConfig()
 SNR_OPTIONS = SNROptions(
@@ -257,7 +258,7 @@ FIXED_BORESIGHT_VECTOR = np.array([1.0, 0.0, 0.0], dtype=float)
 # The plots show local offsets from GRID_CENTER_KM, which usually makes the
 # axes easier to interpret.
 GRID_CENTER_KM = np.array([0, 0.0, 0.0], dtype=float)
-GRID_HALF_WIDTH_KM = np.array([1_500_000.0, 1_000_000.0, 1_000_000.0], dtype=float)
+GRID_HALF_WIDTH_KM = np.array([1_800_000.0, 1_000_000.0, 1_000_000.0], dtype=float)
 
 # Number of samples along x, y, and z. Runtime and storage scale with the
 # product nx * ny * nz. A 61^3 grid has 226,981 points.
@@ -273,6 +274,22 @@ MASK_INSIDE_EARTH = True
 MASK_INSIDE_MOON = True
 MASK_INSIDE_SUN = True
 
+# Radius of the plotted/evaluated exclusion region around each body. The
+# defaults reproduce the original physical-interior masks. Increase either
+# value if a larger keep-out or occultation region is required.
+EARTH_MASK_RADIUS_KM = float(ENVIRONMENT.earth.radius_km)
+MOON_MASK_RADIUS_KM = float(ENVIRONMENT.moon.radius_km)
+
+# Scene overlays for the contour slices. Masked regions are filled using the
+# lowest SNR colour, while the body itself is identified by a labelled outline.
+PLOT_EARTH = True
+PLOT_MOON = True
+PLOT_SPACECRAFT = True
+ANNOTATE_SCENE_OBJECTS = True
+MASK_OUTLINE_LINEWIDTH = 0.8
+BODY_OUTLINE_LINEWIDTH = 1.2
+SPACECRAFT_MARKER_SIZE = 95.0
+
 # -----------------------------------------------------------------------------
 # Orthogonal contour slices
 # -----------------------------------------------------------------------------
@@ -283,8 +300,8 @@ SLICE_Y_OFFSET_KM = 0.0  # x-z contour
 SLICE_Z_OFFSET_KM = 0.0e5  # x-y contour
 
 # Plot distance scaling. For example, 1000.0 displays axes in 10^3 km.
-PLOT_DISTANCE_SCALE_KM = 100000.0
-PLOT_DISTANCE_UNIT_LABEL = r"$10^5$ km"
+PLOT_DISTANCE_SCALE_KM = 1000000.0
+PLOT_DISTANCE_UNIT_LABEL = r"$10^6$ km"
 
 # SNR colour scale. Log scaling is generally more informative when the SNR
 # spans several orders of magnitude.
@@ -418,14 +435,14 @@ def make_validity_mask(asteroid_positions_km: FloatArray) -> NDArray[np.bool_]:
             positions - np.asarray(EARTH_POSITION_KM, dtype=float),
             axis=-1,
         )
-        valid &= earth_range_km > ENVIRONMENT.earth.radius_km
+        valid &= earth_range_km > EARTH_MASK_RADIUS_KM
 
     if MASK_INSIDE_MOON:
         moon_range_km = np.linalg.norm(
             positions - np.asarray(MOON_POSITION_KM, dtype=float),
             axis=-1,
         )
-        valid &= moon_range_km > ENVIRONMENT.moon.radius_km
+        valid &= moon_range_km > MOON_MASK_RADIUS_KM
 
     if MASK_INSIDE_SUN:
         sun_range_km = np.linalg.norm(
@@ -614,14 +631,175 @@ def make_filled_levels(vmin: float, vmax: float) -> FloatArray:
     return np.linspace(vmin, vmax, N_FILLED_CONTOUR_LEVELS)
 
 
+def projected_coordinates(
+        position_km: FloatArray,
+        horizontal_axis: int,
+        vertical_axis: int,
+) -> tuple[float, float]:
+    """Project an absolute Cartesian position into one displayed plane."""
+
+    local_position_km = (
+        np.asarray(position_km, dtype=float)
+        - np.asarray(GRID_CENTER_KM, dtype=float)
+    )
+    return (
+        float(local_position_km[horizontal_axis] / PLOT_DISTANCE_SCALE_KM),
+        float(local_position_km[vertical_axis] / PLOT_DISTANCE_SCALE_KM),
+    )
+
+
+def slice_intersection_radius_scaled(
+        body_position_km: FloatArray,
+        sphere_radius_km: float,
+        fixed_axis: int,
+        slice_coordinate_km: float,
+) -> float | None:
+    """Return the visible circle radius where a slice intersects a sphere."""
+
+    plane_separation_km = abs(
+        float(np.asarray(body_position_km, dtype=float)[fixed_axis])
+        - float(slice_coordinate_km)
+    )
+    if plane_separation_km >= sphere_radius_km:
+        return None
+
+    cross_section_radius_km = np.sqrt(
+        max(sphere_radius_km ** 2 - plane_separation_km ** 2, 0.0)
+    )
+    return float(cross_section_radius_km / PLOT_DISTANCE_SCALE_KM)
+
+
+def add_scene_overlays(
+        axis: plt.Axes,
+        lowest_snr_colour,
+        horizontal_axis: int,
+        vertical_axis: int,
+        fixed_axis: int,
+        slice_coordinate_km: float,
+) -> None:
+    """Overlay Earth, Moon, their slice masks, and the spacecraft."""
+
+    body_specs = []
+    if PLOT_EARTH:
+        body_specs.append(
+            (
+                "Earth",
+                np.asarray(EARTH_POSITION_KM, dtype=float),
+                float(ENVIRONMENT.earth.radius_km),
+                float(EARTH_MASK_RADIUS_KM),
+                "tab:blue",
+            )
+        )
+    if PLOT_MOON:
+        body_specs.append(
+            (
+                "Moon",
+                np.asarray(MOON_POSITION_KM, dtype=float),
+                float(ENVIRONMENT.moon.radius_km),
+                float(MOON_MASK_RADIUS_KM),
+                "0.30",
+            )
+        )
+
+    for name, position_km, body_radius_km, mask_radius_km, edge_colour in body_specs:
+        centre_horizontal, centre_vertical = projected_coordinates(
+            position_km,
+            horizontal_axis,
+            vertical_axis,
+        )
+
+        mask_radius_scaled = slice_intersection_radius_scaled(
+            body_position_km=position_km,
+            sphere_radius_km=mask_radius_km,
+            fixed_axis=fixed_axis,
+            slice_coordinate_km=slice_coordinate_km,
+        )
+        if mask_radius_scaled is not None:
+            axis.add_patch(
+                Circle(
+                    (centre_horizontal, centre_vertical),
+                    mask_radius_scaled,
+                    facecolor=lowest_snr_colour,
+                    edgecolor=edge_colour,
+                    linewidth=MASK_OUTLINE_LINEWIDTH,
+                    linestyle="--",
+                    zorder=3.0,
+                )
+            )
+
+        body_radius_scaled = slice_intersection_radius_scaled(
+            body_position_km=position_km,
+            sphere_radius_km=body_radius_km,
+            fixed_axis=fixed_axis,
+            slice_coordinate_km=slice_coordinate_km,
+        )
+        if body_radius_scaled is None:
+            continue
+
+        axis.add_patch(
+            Circle(
+                (centre_horizontal, centre_vertical),
+                body_radius_scaled,
+                facecolor=lowest_snr_colour,
+                edgecolor=edge_colour,
+                linewidth=BODY_OUTLINE_LINEWIDTH,
+                zorder=4.0,
+            )
+        )
+
+        if ANNOTATE_SCENE_OBJECTS:
+            axis.annotate(
+                name,
+                xy=(centre_horizontal, centre_vertical),
+                xytext=(5, 5),
+                textcoords="offset points",
+                fontsize=9,
+                ha="left",
+                va="bottom",
+                zorder=6.0,
+            )
+
+    if PLOT_SPACECRAFT:
+        spacecraft_horizontal, spacecraft_vertical = projected_coordinates(
+            np.asarray(OBSERVER_POSITION_KM, dtype=float),
+            horizontal_axis,
+            vertical_axis,
+        )
+        axis.scatter(
+            [spacecraft_horizontal],
+            [spacecraft_vertical],
+            marker="*",
+            s=SPACECRAFT_MARKER_SIZE,
+            facecolor="white",
+            edgecolor="black",
+            linewidth=0.9,
+            zorder=7.0,
+            clip_on=False,
+        )
+        if ANNOTATE_SCENE_OBJECTS:
+            axis.annotate(
+                "Spacecraft",
+                xy=(spacecraft_horizontal, spacecraft_vertical),
+                xytext=(6, -7),
+                textcoords="offset points",
+                fontsize=9,
+                ha="left",
+                va="top",
+                zorder=8.0,
+            )
+
+
 def plot_contour_slice(
         horizontal_values: FloatArray,
         vertical_values: FloatArray,
         snr_slice: FloatArray,
         horizontal_label: str,
         vertical_label: str,
-        title: str,
         output_name: str,
+        horizontal_axis: int,
+        vertical_axis: int,
+        fixed_axis: int,
+        slice_coordinate_km: float,
 ) -> None:
     """Create and save one filled SNR contour figure."""
 
@@ -635,27 +813,30 @@ def plot_contour_slice(
     vmin, vmax = choose_colour_limits((0.0, 5))
     levels = make_filled_levels(vmin, vmax)
 
+    valid_for_plot = np.isfinite(values)
     if COLOR_SCALE == "log":
-        plotted_values = np.ma.masked_where(
-            ~np.isfinite(values) | (values <= 0.0),
-            values,
-        )
+        valid_for_plot &= values > 0.0
         norm = LogNorm(vmin=vmin, vmax=vmax)
     else:
-        plotted_values = np.ma.masked_invalid(values)
         norm = Normalize(vmin=vmin, vmax=vmax)
+
+    # Render masked/invalid points with the lowest SNR colour instead of the
+    # default white contour background. Keep a separate masked array for the
+    # labelled contour lines so lines are not drawn through excluded regions.
+    filled_values = np.where(valid_for_plot, values, vmin)
+    line_values = np.ma.masked_where(~valid_for_plot, values)
 
     figure, axis = plt.subplots(figsize=(7.0, 5.5))
     filled = axis.contourf(
         horizontal_mesh,
         vertical_mesh,
-        plotted_values,
+        filled_values,
         levels=levels,
         norm=norm,
         extend="both",
     )
 
-    finite_values = values[np.isfinite(values)]
+    finite_values = values[valid_for_plot]
     if finite_values.size:
         min_value = float(np.min(finite_values))
         max_value = float(np.max(finite_values))
@@ -668,19 +849,28 @@ def plot_contour_slice(
             lines = axis.contour(
                 horizontal_mesh,
                 vertical_mesh,
-                plotted_values,
+                line_values,
                 levels=line_levels,
                 linewidths=0.8,
                 linestyles="--",
             )
             axis.clabel(lines, inline=True, fontsize=8, fmt="%g")
 
+    lowest_snr_colour = filled.cmap(filled.norm(vmin))
+    add_scene_overlays(
+        axis=axis,
+        lowest_snr_colour=lowest_snr_colour,
+        horizontal_axis=horizontal_axis,
+        vertical_axis=vertical_axis,
+        fixed_axis=fixed_axis,
+        slice_coordinate_km=slice_coordinate_km,
+    )
+
     colourbar = figure.colorbar(filled, ax=axis)
     colourbar.set_label("SNR")
 
     axis.set_xlabel(horizontal_label)
     axis.set_ylabel(vertical_label)
-    axis.set_title(title)
     axis.set_aspect("equal", adjustable="box")
     figure.tight_layout()
 
@@ -868,10 +1058,9 @@ def make_isosurface_plots(
             antialiased=True,
             alpha=0.8,
         )
-        axis.set_xlabel(f"x offset ({PLOT_DISTANCE_UNIT_LABEL})")
-        axis.set_ylabel(f"y offset ({PLOT_DISTANCE_UNIT_LABEL})")
-        axis.set_zlabel(f"z offset ({PLOT_DISTANCE_UNIT_LABEL})")
-        axis.set_title(f"SNR = {level:g} isosurface")
+        axis.set_xlabel(f"x ({PLOT_DISTANCE_UNIT_LABEL})")
+        axis.set_ylabel(f"y ({PLOT_DISTANCE_UNIT_LABEL})")
+        axis.set_zlabel(f"z ({PLOT_DISTANCE_UNIT_LABEL})")
         figure.tight_layout()
 
         safe_level = str(level).replace(".", "p")
@@ -944,42 +1133,39 @@ def main() -> None:
         horizontal_values=x_scaled,
         vertical_values=y_scaled,
         snr_slice=snr_grid[:, :, z_index],
-        horizontal_label=f"x offset ({PLOT_DISTANCE_UNIT_LABEL})",
-        vertical_label=f"y offset ({PLOT_DISTANCE_UNIT_LABEL})",
-        title=(
-            "Asteroid SNR in x-y plane\n"
-            f"z offset = {z_local_km[z_index] / PLOT_DISTANCE_SCALE_KM:.6g} "
-            f"{PLOT_DISTANCE_UNIT_LABEL}"
-        ),
+        horizontal_label=f"x ({PLOT_DISTANCE_UNIT_LABEL})",
+        vertical_label=f"y ({PLOT_DISTANCE_UNIT_LABEL})",
         output_name="xy",
+        horizontal_axis=0,
+        vertical_axis=1,
+        fixed_axis=2,
+        slice_coordinate_km=float(z_km[z_index]),
     )
 
     plot_contour_slice(
         horizontal_values=x_scaled,
         vertical_values=z_scaled,
         snr_slice=snr_grid[:, y_index, :],
-        horizontal_label=f"x offset ({PLOT_DISTANCE_UNIT_LABEL})",
-        vertical_label=f"z offset ({PLOT_DISTANCE_UNIT_LABEL})",
-        title=(
-            "Asteroid SNR in x-z plane\n"
-            f"y offset = {y_local_km[y_index] / PLOT_DISTANCE_SCALE_KM:.6g} "
-            f"{PLOT_DISTANCE_UNIT_LABEL}"
-        ),
+        horizontal_label=f"x ({PLOT_DISTANCE_UNIT_LABEL})",
+        vertical_label=f"z ({PLOT_DISTANCE_UNIT_LABEL})",
         output_name="xz",
+        horizontal_axis=0,
+        vertical_axis=2,
+        fixed_axis=1,
+        slice_coordinate_km=float(y_km[y_index]),
     )
 
     plot_contour_slice(
         horizontal_values=y_scaled,
         vertical_values=z_scaled,
         snr_slice=snr_grid[x_index, :, :],
-        horizontal_label=f"y offset ({PLOT_DISTANCE_UNIT_LABEL})",
-        vertical_label=f"z offset ({PLOT_DISTANCE_UNIT_LABEL})",
-        title=(
-            "Asteroid SNR in y-z plane\n"
-            f"x offset = {x_local_km[x_index] / PLOT_DISTANCE_SCALE_KM:.6g} "
-            f"{PLOT_DISTANCE_UNIT_LABEL}"
-        ),
+        horizontal_label=f"y ({PLOT_DISTANCE_UNIT_LABEL})",
+        vertical_label=f"z ({PLOT_DISTANCE_UNIT_LABEL})",
         output_name="yz",
+        horizontal_axis=1,
+        vertical_axis=2,
+        fixed_axis=0,
+        slice_coordinate_km=float(x_km[x_index]),
     )
 
     make_isosurface_plots(

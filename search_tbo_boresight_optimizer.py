@@ -20,18 +20,21 @@ Per observation window
 6. Remove candidates whose complete FOV intersects the invisibility cone.
 7. Sum detectable residence time for every cell whose observer-relative LOS
    lies inside each candidate FOV.
-8. Select the maximum-score candidate and transform it back to inertial axes.
+8. Select the maximum-score candidate and transform it back to EME axes.
+
+For production use, call ``build_single_epoch_search_geometry``. It invokes
+``earth_moon_invisibility_zone.py`` and returns the observer SECR position,
+IV-zone axis, fixed IV-zone half-angle, and matching frame context at one
+JD TDB epoch.
 
 Frame convention
 ----------------
-Residence cells are stored in an Earth-centred synodic frame. The optimizer
-works in synodic directions, but the selected command is returned in both
-synodic and inertial axes. The supplied 3x3 matrix R_I_from_S must satisfy
-
-    v_I = R_I_from_S @ v_S
-
-for direction vectors. Positions additionally include the supplied synodic
-origin position in the inertial frame.
+Residence cells and optimizer geometry use the geocentric SECR frame. The
+selected command is returned in both SECR and geocentric EME/J2000 axes. The
+optimizer never constructs its own rotation matrix. Every EME/ECLIPJ2000/SECR
+conversion is delegated to ``utilities.py`` through ``import utilities as
+util``. A ``FrameContext`` supplies the Earth heliocentric ECLIPJ2000 position
+needed by those utility functions at the current epoch.
 
 SNR convention
 --------------
@@ -56,11 +59,14 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Protocol, TypeAlias
+from typing import Any, Callable, TypeAlias
 
 import numpy as np
 import pandas as pd
 from numpy.typing import ArrayLike, NDArray
+
+import utilities as util
+import earth_moon_invisibility_zone as ivz
 
 
 FloatArray: TypeAlias = NDArray[np.float64]
@@ -118,112 +124,158 @@ class ResidenceGrid:
 
 
 # =============================================================================
-# Synodic/inertial transformation
+# Geocentric SECR / EME frame conversion through utilities.py
 # =============================================================================
 
 
 @dataclass(frozen=True)
-class SynodicInertialTransform:
-    """Instantaneous rigid transformation from synodic to inertial axes.
+class FrameContext:
+    """Single-epoch data required by the supplied SECR conversion utilities.
 
-    Parameters
-    ----------
-    rotation_inertial_from_synodic
-        Proper orthonormal rotation matrix R_I_from_S satisfying
-        ``direction_I = R_I_from_S @ direction_S``.
-    synodic_origin_position_inertial_km
-        Inertial position of the synodic-frame origin. For the residence CSV
-        produced by the companion script, this will normally be Earth's
-        inertial position because the grid is Earth-centred.
+    ``earth_heliocentric_eclip_position_km`` is the Earth position relative to
+    the Sun in ECLIPJ2000 axes at the current epoch. The optimizer does not
+    construct rotation matrices internally; every geocentric EME/ECLIP/SECR
+    conversion is delegated to ``utilities.py``, imported as ``util``.
     """
 
-    rotation_inertial_from_synodic: ArrayLike
-    synodic_origin_position_inertial_km: ArrayLike
+    earth_heliocentric_eclip_position_km: ArrayLike
 
     def __post_init__(self) -> None:
-        rotation = np.asarray(
-            self.rotation_inertial_from_synodic,
+        earth = np.asarray(
+            self.earth_heliocentric_eclip_position_km,
             dtype=float,
         )
-        origin = np.asarray(
-            self.synodic_origin_position_inertial_km,
-            dtype=float,
-        )
-
-        if rotation.shape != (3, 3):
+        if earth.shape != (3,):
             raise ValueError(
-                "rotation_inertial_from_synodic must have shape (3, 3)."
+                "earth_heliocentric_eclip_position_km must have shape (3,)."
             )
-        if origin.shape != (3,):
+        if not np.all(np.isfinite(earth)):
             raise ValueError(
-                "synodic_origin_position_inertial_km must have shape (3,)."
+                "earth_heliocentric_eclip_position_km must be finite."
             )
-        if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(origin)):
-            raise ValueError("Frame transformation values must be finite.")
-
-        identity_error = np.max(
-            np.abs(rotation.T @ rotation - np.eye(3))
-        )
-        determinant = float(np.linalg.det(rotation))
-        if identity_error > 1.0e-10 or not np.isclose(
-            determinant,
-            1.0,
-            atol=1.0e-10,
-        ):
+        if np.linalg.norm(earth) <= 0.0:
             raise ValueError(
-                "rotation_inertial_from_synodic must be a proper orthonormal "
-                "rotation matrix."
+                "earth_heliocentric_eclip_position_km must be nonzero."
             )
-
         object.__setattr__(
             self,
-            "rotation_inertial_from_synodic",
-            rotation,
-        )
-        object.__setattr__(
-            self,
-            "synodic_origin_position_inertial_km",
-            origin,
+            "earth_heliocentric_eclip_position_km",
+            earth,
         )
 
-    @property
-    def rotation_synodic_from_inertial(self) -> FloatArray:
-        return np.asarray(self.rotation_inertial_from_synodic).T
 
-    def directions_synodic_to_inertial(
-        self,
-        directions_synodic: ArrayLike,
-    ) -> FloatArray:
-        directions = np.asarray(directions_synodic, dtype=float)
-        return np.asarray(
-            directions @ np.asarray(
-                self.rotation_inertial_from_synodic,
-            ).T,
+def _position_hint(values: ArrayLike) -> tuple[str, ...]:
+    array = np.asarray(values)
+    if array.ndim == 1 and array.shape == (3,):
+        return ("position",)
+    if array.ndim == 2 and array.shape[1] == 3:
+        return ("batch", "position")
+    raise ValueError("Frame-conversion input must have shape (3,) or (N, 3).")
+
+
+def geo_eme_to_geo_secr(
+    values_geo_eme: ArrayLike,
+    frame_context: FrameContext,
+) -> FloatArray:
+    """Convert geocentric EME/J2000 vectors to geocentric SECR using util."""
+
+    values = np.asarray(values_geo_eme, dtype=float)
+    hint = _position_hint(values)
+    values_geo_eclip = util.geo_eme_to_geo_eclip_generic(
+        values,
+        hint=hint,
+    )
+    values_secr = util.geo_eclip_to_geo_secr_generic(
+        values_geo_eclip,
+        frame_context.earth_heliocentric_eclip_position_km,
+        obj_hint=hint,
+        earth_hint=("position",),
+    )
+    return np.asarray(values_secr, dtype=float)
+
+
+def geo_secr_to_geo_eme(
+    values_secr: ArrayLike,
+    frame_context: FrameContext,
+) -> FloatArray:
+    """Convert geocentric SECR vectors to geocentric EME/J2000 using util."""
+
+    values = np.asarray(values_secr, dtype=float)
+    hint = _position_hint(values)
+    values_geo_eclip = util.geo_secr_to_geo_eclip_generic(
+        values,
+        frame_context.earth_heliocentric_eclip_position_km,
+        obj_hint=hint,
+        earth_hint=("position",),
+    )
+    values_geo_eme = util.geo_eclip_to_geo_eme_generic(
+        values_geo_eclip,
+        hint=hint,
+    )
+    return np.asarray(values_geo_eme, dtype=float)
+
+
+@dataclass(frozen=True)
+class SingleEpochSearchGeometry:
+    """Matched single-epoch observer, IV-zone, and SECR-frame geometry."""
+
+    observer_position_synodic_km: FloatArray
+    invisibility_zone_axis_synodic: FloatArray
+    invisibility_zone_half_angle_rad: float
+    frame_context: FrameContext
+    invisibility_zone: ivz.EarthMoonInvisibilityZone
+
+
+def build_single_epoch_search_geometry(
+    jd_tdb: float,
+    observer_position_geo_eme_km: ArrayLike,
+    meta_kernel_path: Path | str | None = None,
+) -> SingleEpochSearchGeometry:
+    """Build the matched SPICE/IV-zone geometry for one optimizer epoch.
+
+    This function calls ``earth_moon_invisibility_zone.py``. The returned
+    observer SECR position, IV-zone axis, fixed IV-zone half-angle, and
+    ``FrameContext`` all use the same JD TDB epoch and Earth ephemeris.
+    """
+
+    zone = ivz.compute_earth_moon_invisibility_zone(
+        jd_tdb=jd_tdb,
+        spacecraft_position_geo_eme_km=observer_position_geo_eme_km,
+        meta_kernel_path=meta_kernel_path,
+    )
+    frame_context = FrameContext(
+        earth_heliocentric_eclip_position_km=(
+            zone.earth_heliocentric_eclip_position_km
+        )
+    )
+    observer_secr = np.asarray(
+        geo_eme_to_geo_secr(
+            observer_position_geo_eme_km,
+            frame_context,
+        ),
+        dtype=float,
+    )
+
+    if not np.allclose(
+        observer_secr,
+        zone.spacecraft_position_secr_km,
+        atol=1.0e-9,
+        rtol=0.0,
+    ):
+        raise RuntimeError(
+            "Optimizer and IV-zone observer SECR positions are inconsistent."
+        )
+
+    return SingleEpochSearchGeometry(
+        observer_position_synodic_km=observer_secr,
+        invisibility_zone_axis_synodic=np.asarray(
+            zone.axis_secr,
             dtype=float,
-        )
-
-    def directions_inertial_to_synodic(
-        self,
-        directions_inertial: ArrayLike,
-    ) -> FloatArray:
-        directions = np.asarray(directions_inertial, dtype=float)
-        return np.asarray(
-            directions @ self.rotation_synodic_from_inertial.T,
-            dtype=float,
-        )
-
-    def positions_synodic_to_inertial(
-        self,
-        positions_synodic_km: ArrayLike,
-    ) -> FloatArray:
-        positions = np.asarray(positions_synodic_km, dtype=float)
-        rotated = self.directions_synodic_to_inertial(positions)
-        return np.asarray(
-            rotated + np.asarray(
-                self.synodic_origin_position_inertial_km,
-            ),
-            dtype=float,
-        )
+        ),
+        invisibility_zone_half_angle_rad=float(zone.half_angle_rad),
+        frame_context=frame_context,
+        invisibility_zone=zone,
+    )
 
 
 # =============================================================================
@@ -240,7 +292,6 @@ class PointingConfig:
     maximum_boresight_change_rad: float
     candidate_angular_spacing_rad: float
 
-    invisibility_zone_half_angle_rad: float
     invisibility_zone_margin_rad: float = 0.0
 
     enable_previous_score_shortcut: bool = False
@@ -259,9 +310,6 @@ class PointingConfig:
             ),
             "candidate_angular_spacing_rad": (
                 self.candidate_angular_spacing_rad
-            ),
-            "invisibility_zone_half_angle_rad": (
-                self.invisibility_zone_half_angle_rad
             ),
             "invisibility_zone_margin_rad": (
                 self.invisibility_zone_margin_rad
@@ -285,10 +333,6 @@ class PointingConfig:
         if not 0.0 < self.candidate_angular_spacing_rad <= np.pi:
             raise ValueError(
                 "candidate_angular_spacing_rad must lie in (0, pi]."
-            )
-        if not 0.0 <= self.invisibility_zone_half_angle_rad < np.pi:
-            raise ValueError(
-                "invisibility_zone_half_angle_rad must lie in [0, pi)."
             )
         if self.invisibility_zone_margin_rad < 0.0:
             raise ValueError(
@@ -528,12 +572,13 @@ def invisibility_zone_feasible_mask(
 def single_boresight_is_iz_feasible(
     boresight_synodic: ArrayLike,
     invisibility_zone_axis_synodic: ArrayLike,
+    invisibility_zone_half_angle_rad: float,
     config: PointingConfig,
 ) -> bool:
     mask = invisibility_zone_feasible_mask(
         np.asarray(boresight_synodic, dtype=float).reshape(1, 3),
         invisibility_zone_axis_synodic,
-        config.invisibility_zone_half_angle_rad,
+        invisibility_zone_half_angle_rad,
         config.fov_half_angle_rad,
         config.invisibility_zone_margin_rad,
     )
@@ -695,8 +740,7 @@ class PayloadSNRGridEvaluator:
     """Adapter from synodic grid positions to the payload SNR model.
 
     The payload, asteroid, environment, and options objects must be instances
-    from ``payload_asteroid_snr_model.py``. All supplied Sun/Earth/Moon and
-    observer states are inertial and belong to the same epoch and origin.
+    from ``payload_asteroid_snr_model.py``. All supplied Sun/Earth/Moon and observer states are geocentric EME/J2000 and belong to the same epoch and origin.
 
     ``asteroid_velocity_inertial_km_s`` may be one vector with shape (3,),
     broadcast to every hypothetical grid location, or an array with shape
@@ -705,7 +749,7 @@ class PayloadSNRGridEvaluator:
     inertial velocity is unavailable.
     """
 
-    frame_transform: SynodicInertialTransform
+    frame_context: FrameContext
     payload: Any
     asteroid: Any
 
@@ -769,8 +813,9 @@ class PayloadSNRGridEvaluator:
             ) from exc
 
         positions_synodic = np.asarray(positions_synodic_km, dtype=float)
-        positions_inertial = self.frame_transform.positions_synodic_to_inertial(
-            positions_synodic
+        positions_inertial = geo_secr_to_geo_eme(
+            positions_synodic,
+            self.frame_context,
         )
 
         relative_inertial = (
@@ -850,14 +895,22 @@ class PayloadSNRGridEvaluator:
 def determine_search_boresight(
     residence_grid: ResidenceGrid,
     observer_position_synodic_km: ArrayLike,
-    previous_boresight_inertial: ArrayLike,
+    previous_boresight_eme: ArrayLike,
     previous_residence_score_days: float | None,
     invisibility_zone_axis_synodic: ArrayLike,
-    frame_transform: SynodicInertialTransform,
+    invisibility_zone_half_angle_rad: float,
+    frame_context: FrameContext,
     snr_evaluator: SNREvaluator,
     config: PointingConfig,
 ) -> PointingResult:
     """Determine one hard-constrained discrete search boresight."""
+
+    if not np.isfinite(invisibility_zone_half_angle_rad):
+        raise ValueError("invisibility_zone_half_angle_rad must be finite.")
+    if not 0.0 <= invisibility_zone_half_angle_rad < np.pi:
+        raise ValueError(
+            "invisibility_zone_half_angle_rad must lie in [0, pi)."
+        )
 
     positions = np.asarray(
         residence_grid.positions_synodic_km,
@@ -868,14 +921,12 @@ def determine_search_boresight(
         dtype=float,
     )
 
-    previous_boresight_i = _unit_vector(
-        previous_boresight_inertial,
-        "previous_boresight_inertial",
+    previous_boresight_eme_unit = _unit_vector(
+        previous_boresight_eme,
+        "previous_boresight_eme",
     )
     reference_synodic = _unit_vector(
-        frame_transform.directions_inertial_to_synodic(
-            previous_boresight_i,
-        ),
+        geo_eme_to_geo_secr(previous_boresight_eme_unit, frame_context),
         "reference_boresight_synodic",
     )
     iz_axis_synodic = _unit_vector(
@@ -950,6 +1001,7 @@ def determine_search_boresight(
         and single_boresight_is_iz_feasible(
             reference_synodic,
             iz_axis_synodic,
+            invisibility_zone_half_angle_rad,
             config,
         )
     )
@@ -972,10 +1024,8 @@ def determine_search_boresight(
 
         if current_score >= retention_threshold:
             retained_inertial = _unit_vector(
-                frame_transform.directions_synodic_to_inertial(
-                    reference_synodic,
-                ),
-                "retained_boresight_inertial",
+                geo_secr_to_geo_eme(reference_synodic, frame_context),
+                "retained_boresight_eme",
             )
             return PointingResult(
                 status=(
@@ -1038,7 +1088,7 @@ def determine_search_boresight(
         candidate_boresights_synodic=candidates,
         invisibility_zone_axis_synodic=iz_axis_synodic,
         invisibility_zone_half_angle_rad=(
-            config.invisibility_zone_half_angle_rad
+            invisibility_zone_half_angle_rad
         ),
         fov_half_angle_rad=config.fov_half_angle_rad,
         invisibility_zone_margin_rad=(
@@ -1095,10 +1145,8 @@ def determine_search_boresight(
         "selected_boresight_synodic",
     )
     selected_inertial = _unit_vector(
-        frame_transform.directions_synodic_to_inertial(
-            selected_synodic,
-        ),
-        "selected_boresight_inertial",
+        geo_secr_to_geo_eme(selected_synodic, frame_context),
+        "selected_boresight_eme",
     )
 
     selected_membership = fov_membership_mask(
@@ -1210,20 +1258,28 @@ def minimum_working_example() -> None:
 
     observer_synodic_km = np.array([-1.50e6, 0.0, 0.0], dtype=float)
 
-    # Identity is sufficient for this synthetic example. In production,
-    # provide the current epoch's true R_I_from_S and Earth inertial position.
-    frame_transform = SynodicInertialTransform(
-        rotation_inertial_from_synodic=np.eye(3),
-        synodic_origin_position_inertial_km=np.zeros(3),
+    # A synthetic single-epoch Earth heliocentric position. With Earth on the
+    # negative ECLIPJ2000 x-axis, ECLIPJ2000 and SECR x-y axes align. EME still
+    # differs by obliquity, and all conversions go through utilities.py.
+    frame_context = FrameContext(
+        earth_heliocentric_eclip_position_km=np.array(
+            [-149_597_870.7, 0.0, 0.0],
+            dtype=float,
+        )
     )
 
     # Earth/invisibility direction from the observer is +x in this example.
     iz_axis_synodic = np.array([1.0, 0.0, 0.0], dtype=float)
+    iz_half_angle_rad = np.deg2rad(10.0)
 
     # Initial payload direction is already near the stronger residence lobe.
-    initial_boresight_inertial = _direction_from_angles(
+    initial_boresight_synodic = _direction_from_angles(
         np.deg2rad(25.0),
         0.0,
+    )
+    initial_boresight_eme = _unit_vector(
+        geo_secr_to_geo_eme(initial_boresight_synodic, frame_context),
+        "initial_boresight_eme",
     )
 
     config = PointingConfig(
@@ -1231,7 +1287,6 @@ def minimum_working_example() -> None:
         fov_half_angle_rad=np.deg2rad(6.0),
         maximum_boresight_change_rad=np.deg2rad(90.0),
         candidate_angular_spacing_rad=np.deg2rad(1.0),
-        invisibility_zone_half_angle_rad=np.deg2rad(10.0),
         invisibility_zone_margin_rad=np.deg2rad(1.0),
         enable_previous_score_shortcut=True,
         shortcut_minimum_previous_score_fraction=0.95,
@@ -1251,10 +1306,11 @@ def minimum_working_example() -> None:
         first = determine_search_boresight(
             residence_grid=residence_grid,
             observer_position_synodic_km=observer_synodic_km,
-            previous_boresight_inertial=initial_boresight_inertial,
+            previous_boresight_eme=initial_boresight_eme,
             previous_residence_score_days=None,
             invisibility_zone_axis_synodic=iz_axis_synodic,
-            frame_transform=frame_transform,
+            invisibility_zone_half_angle_rad=iz_half_angle_rad,
+            frame_context=frame_context,
             snr_evaluator=snr_evaluator,
             config=config,
         )
@@ -1265,6 +1321,7 @@ def minimum_working_example() -> None:
         assert single_boresight_is_iz_feasible(
             first.boresight_synodic,
             iz_axis_synodic,
+            iz_half_angle_rad,
             config,
         )
 
@@ -1273,10 +1330,11 @@ def minimum_working_example() -> None:
         second = determine_search_boresight(
             residence_grid=residence_grid,
             observer_position_synodic_km=observer_synodic_km,
-            previous_boresight_inertial=first.boresight_inertial,
+            previous_boresight_eme=first.boresight_inertial,
             previous_residence_score_days=first.residence_score_days,
             invisibility_zone_axis_synodic=iz_axis_synodic,
-            frame_transform=frame_transform,
+            invisibility_zone_half_angle_rad=iz_half_angle_rad,
+            frame_context=frame_context,
             snr_evaluator=snr_evaluator,
             config=config,
         )
@@ -1298,7 +1356,7 @@ def minimum_working_example() -> None:
     print(f"First status:  {first.status.value}")
     print(f"First score:   {first.residence_score_days:.3f} days")
     print(
-        "First boresight (synodic): "
+        "First boresight (SECR): "
         f"{np.array2string(first.boresight_synodic, precision=6)}"
     )
     print(f"Second status: {second.status.value}")
