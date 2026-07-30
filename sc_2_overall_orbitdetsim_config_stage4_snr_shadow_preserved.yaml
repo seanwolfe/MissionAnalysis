@@ -1,0 +1,528 @@
+##################################
+# Overall sim parameters
+#############################
+num_spacecraft: 2
+ADD_NOISE: 1
+INCLUDE_EMS_EXCLUSION: 1
+run_IOD_hyperparameter: False
+run_OD: True
+OD_LOAD_BALANCING:
+  redistribute_unfinished_on_start: true
+  repair_done_from_completed_progress: true
+  require_nonempty_outer_for_progress_repair: true
+
+
+formation_phasing:
+  mode: "custom"
+  relative_phase_deg: [0.0, 90.0]
+
+###################################
+# paths & file names
+####################################
+# top-level dir for results
+top_dir: "results_2"
+
+# LPF halo related
+orbit_file_path: 'LPF_orbit_2.csv'
+
+# minimoon related
+# minimoon_files_folder: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb/'
+# minimoon_files_folder: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb_testset/'
+minimoon_files_folder: 'minimoon_files_oorb_testset/'
+#minimoon_files_folder: '/scratch/wolfesea/minimoon_files_oorb/'
+
+# minimoon_master_file_path: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb/minimoon_master_new.csv'
+# minimoon_master_file_path: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb_testset/minimoon_master_new_testset.csv'
+minimoon_master_file_path: 'minimoon_files_oorb_testset/minimoon_master_new_testset.csv'
+#minimoon_master_file_path: '/scratch/wolfesea/minimoon_files_oorb/minimoon_master_with_L1_geo_omega_w_earth.csv'
+
+# detection (visible) related
+visible_files_folder: "visible_dir"
+output_df_file_name: 'initial_tests'
+
+# pure IOD related
+IOD_folder_path: "iod_results"
+error_file_dir: 'Error_files_for_IOD'
+
+# od
+od_file_dir: 'OD_results'
+
+####################################################
+# Spacecraft Specifications
+###################################################
+pixel_scale: 1.27  # arcsec/pixel
+fov: 17.80  # degrees squared
+number_of_pixels: [ 11960, 11960 ]  # height x length
+reaction_wheel_torque: 0.0004  # Nm
+reaction_wheel_momentum: 0.015  # Nms
+mass: 50  # kg
+length: 0.5  # m
+telescope_mass: 5  # kg
+telescope_diameter: 0.28  # m
+telescope_offset: 0.3  # m
+telescope_length: 0.3
+# sigma_ra: 981  # right ascension measurement uncertainty - mas
+# sigma_dec: 939  # declination measurement uncertainty - mas
+sigma_ra: 1887  # right ascension measurement uncertainty - mas
+sigma_dec: 1806  # declination measurement uncertainty - mas
+sigma_pointing: 7200  # pointing uncertainty - mas
+#sigma_ra: 0.
+#sigma_dec: 0.
+#sigma_pointing: 500
+number_of_frames: 16  # the number of measurements expected from detection technique
+time_between_frames: 31.25 # the time between consecutive frames from detection technique, in seconds
+patch_time: 1.6  # time for detection algo to process one patch
+patch_size: [224, 224]  # height x length in pixels
+
+
+####################################################
+# Payload SNR model configuration
+# Stage 4: SNR is evaluated in shadow mode for diagnostics only.
+# The existing geometry-only values and values_ems still control IOD selection.
+# Long spectral arrays are stored in payload_spectral_response.npz.
+####################################################
+payload_snr:
+  schema_version: 1
+  enabled: true
+  shadow_mode: false  # Calculate SNR but do not reject geometric detections yet.
+  chunk_size: 20000  # Maximum candidate epochs evaluated in one SNR batch.
+  snr_threshold: 3.0
+
+  optics:
+    aperture_diameter_m: 0.198
+    focal_length_m: 1.586
+    pixel_scale_arcsec_per_px: 0.91
+    pixel_pitch_m: 7.0e-6
+    psf_sigma_px: 1.1
+
+  detector:
+    exposure_time_s: 65
+    dark_current_e_per_s_px: 0.069
+    read_noise_e_rms_per_px: 5
+    background_surface_brightness_mag_arcsec2: 22
+
+  spectral_response:
+    file_path: "payload_spectral_response.npz"
+    wavelength_key: "wavelength_m"
+    quantum_efficiency_key: "quantum_efficiency"
+    optical_throughput_key: "optical_throughput"
+    wavelength_lower_m: null
+    wavelength_upper_m: null
+    spectral_samples: 2001
+    zero_point_mag: null
+    vega_flux_density_w_m2_m: 0.0368
+    vega_reference_wavelength_m: 5.55e-7
+
+  asteroid:
+    absolute_magnitude_metadata_column: "H"
+    geometric_albedo: 0.15
+    g12: 0.64
+
+  angular_rate:
+    # Production simulations derive apparent rate from relative position and velocity.
+    mode: "state_derived"
+
+  environment:
+    solar_radius_km: 695700
+    solar_temperature_k: 5772
+
+    earth:
+      radius_km: 6371
+      geometric_albedo: 0.434
+      phase_law: "lambert"
+
+    moon:
+      radius_km: 1737.4
+      geometric_albedo: 0.12
+      phase_law: "lommel_seeliger"
+
+  stray_light:
+    off_axis_angle_deg: [ 0.0, 5.0, 10.0, 15.0 ]
+    efficiency: [ 1.0, 2.45e-7, 5.16e-8, 2.45e-8 ]
+    interpolation: "log10"  # Log interpolation between measured positive points.
+    hold_last_value: false  # Do not retain the final efficiency indefinitely.
+    zero_at_angle_deg: 16.0  # Linear decrease from the last point to zero here.
+
+  options:
+    include_earth_double_reflection: true
+    include_moon_double_reflection: true
+    include_earth_stray_light: true
+    include_moon_stray_light: true
+    aperture_pixel_mode: "continuous"
+    validate_inputs: true
+
+  diagnostics:
+    enabled: true
+    output_folder: "snr_diagnostics"
+    save_full_epoch_data: true
+
+
+##################################################
+# Formation parameters
+#################################################
+quasi_halo_start: 140000  # index number where the quasi-halo orbit for Lisa pathfinder starts in the dataframe
+quasi_halo_one_period_end: 247500  # index number where one 'period' of the orbit has been reached
+quasi_halo_end: 350500 # 355000  # practically  # esthetically 350500  # index number where lisa pathfinder exits quasi-halo orbit
+
+
+#####################################################
+# Asteroid parameters
+#####################################################
+asteroid_mass: 1.0e+5
+
+
+#######################################################
+# Visible simulation parameters
+######################################################
+number_of_runs: 1  # number of runs per minimoon (the formation is reinitiallized each time)
+number_of_rows_per_part: 10000000
+save_format: 'csv' # csv or parquet, also needs to be specified when expecting to read files
+
+
+#################################################################
+# Physics-informed extreme learning machine parameters - pure IOD
+#################################################################
+seed: 42
+normalization_ratio: 1
+gaussian_std_scale: 1
+M2: 0.1
+NUMBER_OF_OBSERVATIONS: 16
+TIME_DELTA: 0.6
+TOTAL_POINTS: 250
+SAMPLING_METHOD: "uniform"
+INPUT_RANGE: [-1.0, 1.0]
+HIDDEN_DIMENSION: 250
+PHYSICS_WEIGHT: 1.0e+3
+LAMBDA_DIST: 1.0e-2
+WEIGHT_SCALE_FACTOR: 1.0e-2
+NUMBER_OF_ITERATIONS: 2
+TEMPERATURE: 1.0e+8
+X_TOLERANCE: 1.0e-15
+F_TOLERANCE: 1.0e-15
+MAX_FUNCTION_EVAL: 1000
+MAX_ITERATiONS: 1000
+G_TOLERANCE: 1.0e-15
+MIN_RHO: 0.0006684587122
+MAX_RHO: 0.06684587122
+MIN_RHO_DOT: -0.05033557046
+MAX_RHO_DOT: 0.05033557046
+DELTA_RHO: 6.68459e-8
+DELTA_RHO_DOT: 0.00167785234
+
+
+###############################################
+# Running the PIELM IOD simulation - Testing ground
+##############################################
+dynamics: 'NBD'
+orbit: 'TBO'
+observer: 'SPACE'
+optimizer: 'CONSTRAINED_BASIN_HOPPING'
+SYSTEM_MASS_PARAMETER: 3.0404e-6
+error:
+  num_points: 1000
+
+
+###############################################
+# IOD hyperparameter tuning
+##############################################
+IOD_HYPERPARAMETER:
+  enabled: false
+
+  # Number of repeated stochastic trials per data file / hyperparameter combo.
+  # Keep at 1 initially; increase if you want ANOVA to separate random-seed effects.
+  trials_per_combo: 1
+
+  subset:
+    # Options:
+    #   sample          -> create MASTER_IOD_TUNING.csv and MASTER_IOD_TEST.csv from MASTER_IOD.csv
+    #   explicit_master -> use an already-created tuning master file
+    mode: sample
+
+    source_master_file: MASTER_IOD.csv
+    tuning_master_file: MASTER_IOD_TUNING.csv
+    test_master_file: MASTER_IOD_TEST.csv
+
+    # Set this for the tuning subset size.
+    n_tuning_cases: 200
+
+    # Options:
+    #   complement -> all rows not in tuning become test
+    #   sample     -> draw n_test_cases from rows not in tuning
+    test_mode: complement
+    # n_test_cases: 100   # Only used when test_mode: sample
+
+    random_seed: 12345
+
+    # If true, previously created MASTER_IOD_TUNING.csv / MASTER_IOD_TEST.csv are reused.
+    # This ensures all hyperparameter candidates use the same files across reruns.
+    reuse_existing_subset_files: true
+
+  output:
+    # Relative paths are placed under util._iod_dir(config), e.g. IOD_folder_path/spacecraft_N/...
+    output_dir: 'iod_hyperparameter_results'
+    per_run_dir: 'per_run_iod_files'
+    metadata_file: 'IOD_HYPERPARAMETER_RESULTS.csv'
+    save_per_run_iod_files: true
+
+    # If false, failures are considered completed and are not retried on resume.
+    retry_failed: false
+
+  metrics:
+    # PIELM_basinhopping_w_range_nbody.py trains on the _PHYS columns, so metrics use those data.
+    measurement_variant: physical
+
+    # final_pos[-1] is the artificial collocation-extension endpoint when TIME_DELTA > 0.
+    # final_pos[-2] is the final observation-arc state, matching the previous run_IOD behavior.
+    final_state_index: -2
+
+  # Every entry should be a list. Single-value lists are allowed.
+  # M2 maps to the middle collocation layer width and is converted to LAYER_RATIOS internally.
+  # all non-swept parameters are taken from the pielm iod part of the config
+  sweep:
+    M2: [0.5]
+    TIME_DELTA: [0.00000001, 0.2, 0.6, 0.8, 1.0, 1.2, 1.4, 2, 5, 10, 30]
+    TOTAL_POINTS: [100]
+    HIDDEN_DIMENSION: [100]
+    PHYSICS_WEIGHT: [1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 1.0e+1, 1.0e+2, 1.0e+3, 1.0e+4, 1.0e+5]
+    LAMBDA_DIST: [1.0e-10, 1.0e-9, 1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
+    WEIGHT_SCALE_FACTOR: [1.0e-10, 1.0e-9, 1.0e-8, 1.0e-7, 1.0e-6, 1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
+    NUMBER_OF_ITERATIONS: [100]
+    TEMPERATURE: [1.0e+4]
+    MIN_RHO: [0.00006684587122]
+    MAX_RHO: [0.334229561]
+    MIN_RHO_DOT: [-0.33557046979]
+    MAX_RHO_DOT: [0.33557046979]
+    DELTA_RHO: [6.684587122e-6]
+    DELTA_RHO_DOT: [0.0033557046]
+
+
+
+###########################################
+# Attitude Coordination Parameters
+##########################################
+# epoch grid to search over
+epochs:
+  dt_min: 1.0   # in seconds, first time to check
+  dt_max: 3600.0  # last time to check
+  n_dt: 7       # number of checks
+  average_epoch_time: 20  # average time to run the att coord algorithm for one time, seconds
+
+d_mahal: 3.0
+use_tracking: True
+
+optimizer_att_coord:
+  kappa_sigma: 1500.0
+  n_mc: 20000
+  n_restarts: 1
+  lambda_k1: 0.5
+  n_boundary_candidates: 10
+  nshell: 400
+  restart_noise_scale: 0.05
+  jitter: [-1.0, 1.0, 0.0]
+  max_iterations: 60
+  ftol: 1.0e-10
+  display: False
+  num_candidates: 100
+
+ems:
+  enabled: true
+  half_angle_deg: 12.0
+  p_em: [0.0, 0.0, 0.0]
+  R_em: 0.5e+6
+  alpha_s_deg: 2
+  lambda_em: 5
+  beta_zeta: 1500.0
+
+
+###################################
+# Running the overall OD algorithm
+##################################
+od_diagnostics:
+    log_inner_kf: True
+    log_attcoord_candidates: True
+    log_optimizer_history: True
+    outer_loop_dir: "outer_loop"
+    detail_root_dir: "detailed"
+
+base_seed: 1765220306
+num_od_runs: 1
+od_duration_days: 30
+od_max_steps: 1000
+od_status_every: 20
+iod_cov_topo_std: [4.4, 2.31, 1.28e+6, 3.27e-5, 2.44e-5, 1.09]  # ra, dec, rho, ra dot, dec dot, rho dot (deg, km, deg/s, km/s)
+radial_process_noise: 1.0e-15  # radial noise in RTN frame (km/s^2)^2 /s
+track_process_noise: 1.0e-15 # along track noise in RTN frame (km/s^2)^2 /s
+normal_process_noise: 1.0e-15 # normal to track noise in RTN frame (km/s^2)^2 / s
+sigma_meas_noise: 1.0e+7  # measurement uncertainty in mas
+
+adaptive_R:
+    window: 20  # window over which innovation is considered
+    min_samples: 3
+    psd_floor: 1.0e-18
+    single_obs_rho: 1.28e+6
+    single_obs_rhodot: 1.0
+    multi_observer_maturity_threshold: 5
+    mature_single_observer_injection: "decayed"
+
+# weight values for SPKF portion
+alpha_ukf: 0.1                                     # alpha beta kappa together determine spread of sigmapoints
+beta_ukf: 2
+kappa_ukf: 0
+epsilon_ukf: 0.0000000001
+
+od_stop:
+  enabled: true
+
+  pos_trace_threshold_km2: 1.0e4
+  vel_trace_threshold_km2_s2: 1.0e-5
+
+  nis_mean_min: 0.2
+  nis_mean_max: 10.0
+  nis_min_count: 5
+
+  required_consecutive_steps: 10
+
+od_checkpoint:
+  enabled: true
+  checkpoint_name: "checkpoint_state.pkl"
+
+  walltime_guard:
+    enabled: true
+    max_walltime_sec: 86400      # 24 hours
+    safety_buffer_sec: 1800      # stop/checkpoint 30 min early
+
+od_master:
+  enabled: true
+
+  # Default location is:
+  # <iod_dir>/od_master_rows
+  # You can omit this unless you want a custom path.
+  # dir: "/path/to/iod_results/spacecraft_6/od_master_rows"
+
+  rank_filename_template: "od_master_rank_{rank}.csv"
+
+  # If true, rank 0 tries to merge all OD summaries into MASTER_IOD.csv
+  # at the end of run_OD().
+  merge_into_master_at_end: true
+
+  merge_glob: "od_master_rank_*.csv"
+
+od_no_detection:
+  # During EMS blackout, skip attitude coordination and advance by this amount.
+  ems_blackout_dt_sec: 7200
+
+  # After EMS blackout clears, allow this many attitude-coordination
+  # reacquisition attempts before declaring the object lost.
+  max_reacquisition_attempts_after_blackout: 2
+
+  # If EMS is visible but there is still no detection, terminate as object lost.
+  terminate_if_ems_visible_but_not_detected: true
+
+attcoord_tracking:
+  preserve_detector_anchor: True
+  anchor_ems_infeasible_fallback: "free"  # release anchor and run old/free behaviour
+
+  # Current implementation supports this policy:
+  # old detectors stay ahead of new detectors in the custody queue.
+  anchor_policy: "oldest_still_detecting"
+
+  # Recompute fixed anchor boresight for each candidate epoch:
+  # u_fix_k = normalize(p_hat_k - p_anchor_k)
+  anchor_fixed_mode: "mean_los_per_epoch"
+
+  # If the current anchor cannot point to the mean LOS over the candidate horizon,
+  # try the next-oldest detector. If all anchors fail, release and optimize freely.
+  anchor_infeasible_fallback: "next_oldest"
+
+
+####################################################
+# constants
+####################################################
+AU_TO_M: 149597870691  # 1 AU in meters
+KM_TO_M: 1000
+SECONDS_PER_DAY: 86400
+MAS_TO_DEGREE: 3600000
+EARTH_RADIUS_KM: 6378.1366
+EARTH_MASS_PARAMETER: 398600.1  # km^3/s^2
+MOON_RADIUS_KM: 1738.1
+SUN_MASS: 1.989E+30
+MERCURY_MASS: 0.33e+24  # KG
+VENUS_MASS: 4.87e+24
+EARTH_MASS: 5.97e+24
+MOON_MASS: 0.073e+24
+MARS_MASS: 0.642e+24
+JUPITER_MASS: 1898.0e+24
+SATURN_MASS: 568.0e+24
+URANUS_MASS: 86.8e+24
+NEPTUNE_MASS: 102.0e+24
+GRAVITATIONAL_CONSTANT: 6.67430e-11  # m^3 kg^-1 s^-2
+EARTH_HILL_RADIUS_KM: 1.5e+6  # hill radius 0.01 au
+
+
+##############################################
+# column names
+##############################################
+#lpf halo related
+orbit_column_names: [
+  "Time", "GEO_EME_X_(km)", "GEO_EME_Y_(km)", "GEO_EME_Z_(km)",
+  "GEO_EME_Vx_(km/s)", "GEO_EME_Vy_(km/s)", "GEO_EME_Vz_(km/s)",
+  "GEO_ECLIP_X_(km)", "GEO_ECLIP_Y_(km)", "GEO_ECLIP_Z_(km)",
+  "SUN_EARTH_CO_X_(km)", "SUN_EARTH_CO_Y_(km)", "SUN_EARTH_CO_Z_(km)",
+  "MOON_SUN_EARTH_CO_X_(km)", "MOON_SUN_EARTH_CO_Y_(km)", "MOON_SUN_EARTH_CO_Z_(km)"
+]
+
+# minimoon related
+minimoon_column_names: [ "Object id", "Julian Date", "Distance", "Helio q", "Helio e", "Helio i", "Helio Omega",
+                         "Helio omega", "Helio M", "Helio x", "Helio y", "Helio z", "Helio vx", "Helio vy", "Helio vz",
+                         "Geo x", "Geo y", "Geo z", "Geo vx", "Geo vy", "Geo vz", "Geo q", "Geo e", "Geo i",
+                         "Geo Omega", "Geo omega", "Geo M", "Earth x (Helio)", "Earth y (Helio)", "Earth z (Helio)",
+                         "Earth vx (Helio)", "Earth vy (Helio)", "Earth vz (Helio)", "Moon x (Helio)",
+                         "Moon y (Helio)", "Moon z (Helio)", "Moon vx (Helio)", "Moon vy (Helio)", "Moon vz (Helio)",
+                         "Synodic x", "Synodic y", "Synodic z", "Eclip Long", "sun-ast-dist", "sunearthl1-ast-dist",
+                         "phase_angle", "apparent_magnitude", "Moon Synodic x", "Moon Synodic y", "Moon Synodic z" ]
+
+# Getting IOD data parameters related
+visible_file_columns: ['values', "total_length", 'spacecraft_1_ini_pos']
+IOD_data_columns: ["EPOCH(JDTDB)", "HELIO_X(AU)", "HELIO_Y(AU)", "HELIO_Z(AU)", "HELIO_VX(AU/D)", "HELIO_VY(AU/D)",
+                   "HELIO_VZ(AU/D)", "SC_HELIO_X(AU)", "SC_HELIO_Y(AU)", "SC_HELIO_Z(AU)", "SC_HELIO_VX(AU/D)",
+                   "SC_HELIO_VY(AU/D)", "SC_HELIO_VZ(AU/D)", 'SIN_RA', 'COS_RA', 'SIN_DEC']
+IOD_data_columns_geo: ["EPOCH(JDTDB)", "GEO_X(KM)", "GEO_Y(KM)", "GEO_Z(KM)", "GEO_VX(KM/S)", "GEO_VY(KM/S)",
+                   "GEO_VZ(KM/S)", "SC_GEO_X(KM)", "SC_GEO_Y(KM)", "SC_GEO_Z(KM)", "SC_GEO_VX(KM/S)",
+                   "SC_GEO_VY(KM/S)", "SC_GEO_VZ(KM/S)", 'SIN_RA', 'COS_RA', 'SIN_DEC']
+IOD_data_columns_geo_and_phys: ["EPOCH(JDTDB)", "GEO_X(KM)", "GEO_Y(KM)", "GEO_Z(KM)", "GEO_VX(KM/S)", "GEO_VY(KM/S)",
+                   "GEO_VZ(KM/S)", "SC_GEO_X(KM)", "SC_GEO_Y(KM)", "SC_GEO_Z(KM)", "SC_GEO_VX(KM/S)",
+                   "SC_GEO_VY(KM/S)", "SC_GEO_VZ(KM/S)", 'SIN_RA', 'COS_RA', 'SIN_DEC', "SC_GEO_X(KM)_PHYS",
+                                "SC_GEO_Y(KM)_PHYS", "SC_GEO_Z(KM)_PHYS", "SC_GEO_VX(KM/S)_PHYS",
+                   "SC_GEO_VY(KM/S)_PHYS", "SC_GEO_VZ(KM/S)_PHYS", 'SIN_RA_PHYS', 'COS_RA_PHYS', 'SIN_DEC_PHYS']
+index_columns: ["run_number", "object_id", "spacecraft_number"]
+
+
+#############################
+# Visualization relevant parameters
+############################
+ray_length: 8.0e+6
+two_d_prop:
+  stride: 1
+  n_std: 3
+  xlim: [-5.0e+6, 5.0e+6]
+  ylim: [-5.0e+6, 5.0e+6]
+three_d_prop:
+  history_ids:
+  xlim: [-5.0e+6, 5.0e+6]
+  ylim: [-5.0e+6, 5.0e+6]
+  zlim: [-5.0e+6, 5.0e+6]
+  Nx: 300
+  Ny: 300
+  Nz: 300
+  max_points: 800_000
+opt_map:
+  n_mc: 20000
+  n_grid_theta: 100
+  n_grid_phi: 140
+  rstride: 1
+  cstride: 1
+  linewidth_3d: 0.2
+  alpha: 0.9
+  linewidth_2d: 1.5
+  marker_size: 5
+  levels: 35

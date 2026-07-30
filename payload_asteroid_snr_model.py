@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 """
-Asteroid signal-to-noise ratio model.
+Pure asteroid signal-to-noise ratio physics model.
+
+This module contains no mission configuration loading, file I/O, plotting,
+MPI logic, thresholding, or detection decisions. Mission code should construct
+the dataclasses defined here and call :func:`compute_asteroid_snr`.
 
 This module implements the electron-count SNR model described by
 
@@ -50,14 +54,10 @@ Key conventions
    - All wavelength integrals use composite trapezoidal integration.
 
 6. The adopted stray-light efficiency is wavelength independent and is
-   interpolated linearly in log10(zeta) through:
-
-       (0 deg, 1.0)
-       (5 deg, 2.45e-7)
-       (10 deg, 5.16e-8)
-       (15 deg, 2.45e-8)
-
-   The value is held constant at 2.45e-8 for off-axis angles >= 15 deg.
+   interpolated linearly in log10(zeta) through the supplied positive curve
+   points. An optional ``zero_at_angle_deg`` then linearly reduces the final
+   tabulated efficiency to zero between the last curve angle and the specified
+   zero angle. At and beyond that angle, the efficiency is exactly zero.
    This is a residual-ghost-based approximation; separate roughness and
    contamination terms are not modelled.
 
@@ -215,6 +215,36 @@ class EnvironmentConfig:
         geometric_albedo=DEFAULT_MOON_GEOMETRIC_ALBEDO,
         phase_law="lommel_seeliger",
     )
+
+
+@dataclass(frozen=True)
+class StrayLightConfig:
+    """Residual-ghost stray-light efficiency curve.
+
+    Angles are in degrees. Interpolation through the positive tabulated
+    points is performed in log10 efficiency. If ``zero_at_angle_deg`` is set,
+    the efficiency decreases linearly in ordinary efficiency from the final
+    tabulated value to zero at that angle, and remains zero thereafter. This
+    zero-tail setting takes precedence over ``hold_last_value``.
+    """
+
+    off_axis_angle_deg: ArrayLike = (0.0, 5.0, 10.0, 15.0)
+    efficiency: ArrayLike = (1.0, 2.45e-7, 5.16e-8, 2.45e-8)
+    interpolation: Literal["log10"] = "log10"
+    hold_last_value: bool = True
+    zero_at_angle_deg: float | None = None
+
+
+@dataclass(frozen=True)
+class PreparedPayloadTerms:
+    """Payload-static quantities that may be reused across many evaluations."""
+
+    wavelength_m: FloatArray
+    quantum_efficiency: FloatArray
+    optical_throughput: FloatArray
+    zero_point_mag: float
+    solar_response_integral: float
+    payload_area_m2: float
 
 
 @dataclass(frozen=True)
@@ -583,29 +613,78 @@ def lommel_seeliger_phase_function(phase_angle_rad: ArrayLike) -> FloatArray:
     return np.maximum(np.asarray(value, dtype=float), 0.0)
 
 
-def stray_light_efficiency(off_axis_angle_rad: ArrayLike) -> FloatArray:
-    """Residual-ghost stray-light efficiency.
+def stray_light_efficiency(
+    off_axis_angle_rad: ArrayLike,
+    config: StrayLightConfig | None = None,
+) -> FloatArray:
+    """Evaluate the configured residual-ghost stray-light efficiency.
 
-    Interpolation is linear in log10(zeta) because the source curve is
-    piecewise linear on a logarithmic vertical axis. The last value is held
-    constant for angles >= 15 degrees.
+    The positive tabulated curve is interpolated in log10 efficiency. When a
+    zero angle is configured, the segment after the final tabulated point is
+    interpolated linearly in ordinary efficiency to exactly zero. Logarithmic
+    interpolation cannot include a zero endpoint.
     """
 
+    cfg = config or StrayLightConfig()
     theta_deg = np.rad2deg(np.asarray(off_axis_angle_rad, dtype=float))
+    theta_points_deg = np.asarray(cfg.off_axis_angle_deg, dtype=float)
+    zeta_points = np.asarray(cfg.efficiency, dtype=float)
 
-    theta_points_deg = np.array([0.0, 5.0, 10.0, 15.0], dtype=float)
-    zeta_points = np.array(
-        [1.0, 2.45e-7, 5.16e-8, 2.45e-8],
-        dtype=float,
-    )
+    if theta_points_deg.ndim != 1 or zeta_points.ndim != 1:
+        raise ValueError("Stray-light curve arrays must be one-dimensional.")
+    if theta_points_deg.size < 2 or theta_points_deg.size != zeta_points.size:
+        raise ValueError(
+            "Stray-light angle and efficiency arrays must have equal length "
+            "and contain at least two points."
+        )
+    if np.any(~np.isfinite(theta_points_deg)) or np.any(np.diff(theta_points_deg) <= 0.0):
+        raise ValueError("Stray-light angles must be finite and strictly increasing.")
+    if np.any(~np.isfinite(zeta_points)) or np.any(zeta_points <= 0.0):
+        raise ValueError("Stray-light efficiencies must be finite and positive.")
+    if cfg.interpolation != "log10":
+        raise ValueError(f"Unsupported stray-light interpolation: {cfg.interpolation!r}.")
+    if not isinstance(cfg.hold_last_value, bool):
+        raise TypeError("stray_light.hold_last_value must be boolean.")
 
-    theta_clipped_deg = np.clip(theta_deg, 0.0, 15.0)
+    last_angle_deg = float(theta_points_deg[-1])
+    zero_angle_deg = cfg.zero_at_angle_deg
+    if zero_angle_deg is not None:
+        zero_angle_deg = float(zero_angle_deg)
+        if not np.isfinite(zero_angle_deg) or zero_angle_deg <= last_angle_deg:
+            raise ValueError(
+                "stray_light.zero_at_angle_deg must be finite and greater "
+                "than the final tabulated off-axis angle."
+            )
+
+    # Interpolate only within the positive tabulated curve. np.interp would
+    # otherwise retain the last value beyond the curve by default.
+    theta_curve = np.clip(theta_deg, theta_points_deg[0], last_angle_deg)
     log10_zeta = np.interp(
-        theta_clipped_deg,
+        theta_curve,
         theta_points_deg,
         np.log10(zeta_points),
     )
-    return np.asarray(10.0 ** log10_zeta, dtype=float)
+    result = np.asarray(10.0 ** log10_zeta, dtype=float)
+
+    if zero_angle_deg is not None:
+        # Linear tail in ordinary efficiency: zeta(last)=zeta_last and
+        # zeta(zero_angle)=0. The result remains exactly zero thereafter.
+        tail_fraction = np.clip(
+            (zero_angle_deg - theta_deg) / (zero_angle_deg - last_angle_deg),
+            0.0,
+            1.0,
+        )
+        tail_value = zeta_points[-1] * tail_fraction
+        tail_value = np.where(
+            theta_deg >= zero_angle_deg - 1.0e-12,
+            0.0,
+            tail_value,
+        )
+        result = np.where(theta_deg > last_angle_deg, tail_value, result)
+    elif not cfg.hold_last_value:
+        result = np.where(theta_deg > last_angle_deg, 0.0, result)
+
+    return np.asarray(result, dtype=float)
 
 
 def compute_apparent_angular_speed(
@@ -672,6 +751,36 @@ def compute_apparent_angular_speed(
     )
 
 
+def prepare_payload_terms(
+    payload: PayloadConfig,
+    environment: EnvironmentConfig | None = None,
+) -> PreparedPayloadTerms:
+    """Precompute payload-static spectral and photometric quantities."""
+
+    env = environment or EnvironmentConfig()
+    wavelength_m, qe, throughput = _prepare_spectral_inputs(payload)
+    zero_point_mag = compute_photometric_zero_point(
+        payload=payload,
+        wavelength_m=wavelength_m,
+        quantum_efficiency=qe,
+        optical_throughput=throughput,
+    )
+    solar_response_integral = compute_solar_response_integral(
+        wavelength_m=wavelength_m,
+        solar_temperature_k=env.solar_temperature_k,
+        quantum_efficiency=qe,
+        optical_throughput=throughput,
+    )
+    return PreparedPayloadTerms(
+        wavelength_m=np.asarray(wavelength_m, dtype=float).copy(),
+        quantum_efficiency=np.asarray(qe, dtype=float).copy(),
+        optical_throughput=np.asarray(throughput, dtype=float).copy(),
+        zero_point_mag=float(zero_point_mag),
+        solar_response_integral=float(solar_response_integral),
+        payload_area_m2=_payload_area_m2(payload.aperture_diameter_m),
+    )
+
+
 def compute_asteroid_snr(
     payload: PayloadConfig,
     asteroid: AsteroidProperties,
@@ -679,6 +788,8 @@ def compute_asteroid_snr(
     environment: EnvironmentConfig | None = None,
     options: SNROptions | None = None,
     phase_model: HG12PhaseModel | None = None,
+    stray_light: StrayLightConfig | None = None,
+    prepared_terms: PreparedPayloadTerms | None = None,
 ) -> SNRResult:
     """Compute the asteroid SNR for one observation or a broadcast batch.
 
@@ -717,6 +828,7 @@ def compute_asteroid_snr(
     environment = environment or EnvironmentConfig()
     options = options or SNROptions()
     phase_model = phase_model or HG12PhaseModel.from_default_table()
+    stray_light = stray_light or StrayLightConfig()
 
     (
         absolute_magnitude,
@@ -735,6 +847,7 @@ def compute_asteroid_snr(
             payload=payload,
             environment=environment,
             options=options,
+            stray_light=stray_light,
             absolute_magnitude=absolute_magnitude,
             geometric_albedo=geometric_albedo,
             g12=g12,
@@ -742,21 +855,11 @@ def compute_asteroid_snr(
             geometry=batch_geometry,
         )
 
-    wavelength_m, qe, throughput = _prepare_spectral_inputs(payload)
-
-    zero_point_mag = compute_photometric_zero_point(
-        payload=payload,
-        wavelength_m=wavelength_m,
-        quantum_efficiency=qe,
-        optical_throughput=throughput,
-    )
-
-    solar_response_integral = compute_solar_response_integral(
-        wavelength_m=wavelength_m,
-        solar_temperature_k=environment.solar_temperature_k,
-        quantum_efficiency=qe,
-        optical_throughput=throughput,
-    )
+    prepared = prepared_terms or prepare_payload_terms(payload, environment)
+    wavelength_m = prepared.wavelength_m
+    zero_point_mag = prepared.zero_point_mag
+    solar_response_integral = prepared.solar_response_integral
+    payload_area_m2 = prepared.payload_area_m2
 
     geometry_terms = _compute_observation_geometry(batch_geometry)
 
@@ -799,7 +902,7 @@ def compute_asteroid_snr(
 
     if options.include_earth_double_reflection:
         earth_double_reflection_rate_e_s = compute_double_reflection_rate(
-            payload_area_m2=_payload_area_m2(payload.aperture_diameter_m),
+            payload_area_m2=payload_area_m2,
             asteroid_albedo=geometric_albedo,
             asteroid_radius_km=asteroid_radius_km,
             asteroid_phase_function=earth_asteroid_phase.phase_function,
@@ -826,7 +929,7 @@ def compute_asteroid_snr(
 
     if options.include_moon_double_reflection:
         moon_double_reflection_rate_e_s = compute_double_reflection_rate(
-            payload_area_m2=_payload_area_m2(payload.aperture_diameter_m),
+            payload_area_m2=payload_area_m2,
             asteroid_albedo=geometric_albedo,
             asteroid_radius_km=asteroid_radius_km,
             asteroid_phase_function=moon_asteroid_phase.phase_function,
@@ -883,7 +986,7 @@ def compute_asteroid_snr(
     if options.include_earth_stray_light:
         earth_stray_light_rate_e_s_px = compute_stray_light_rate(
             payload=payload,
-            payload_area_m2=_payload_area_m2(payload.aperture_diameter_m),
+            payload_area_m2=payload_area_m2,
             body=environment.earth,
             body_phase_function=_evaluate_body_phase_law(
                 environment.earth,
@@ -898,6 +1001,7 @@ def compute_asteroid_snr(
             ),
             solar_radius_km=environment.solar_radius_km,
             solar_response_integral=solar_response_integral,
+            stray_light=stray_light,
         )
     else:
         earth_stray_light_rate_e_s_px = zeros.copy()
@@ -905,7 +1009,7 @@ def compute_asteroid_snr(
     if options.include_moon_stray_light:
         moon_stray_light_rate_e_s_px = compute_stray_light_rate(
             payload=payload,
-            payload_area_m2=_payload_area_m2(payload.aperture_diameter_m),
+            payload_area_m2=payload_area_m2,
             body=environment.moon,
             body_phase_function=_evaluate_body_phase_law(
                 environment.moon,
@@ -920,6 +1024,7 @@ def compute_asteroid_snr(
             ),
             solar_radius_km=environment.solar_radius_km,
             solar_response_integral=solar_response_integral,
+            stray_light=stray_light,
         )
     else:
         moon_stray_light_rate_e_s_px = zeros.copy()
@@ -1354,6 +1459,7 @@ def compute_stray_light_rate(
     body_off_axis_angle_rad: ArrayLike,
     solar_radius_km: float,
     solar_response_integral: float,
+    stray_light: StrayLightConfig | None = None,
 ) -> FloatArray:
     """Calculate body stray-light electron rate per aperture pixel.
 
@@ -1373,7 +1479,7 @@ def compute_stray_light_rate(
     theta_body = np.asarray(body_off_axis_angle_rad, dtype=float)
 
     projected_cosine = np.maximum(np.cos(theta_body), 0.0)
-    zeta = stray_light_efficiency(theta_body)
+    zeta = stray_light_efficiency(theta_body, stray_light)
 
     projected_pixel_area_m2 = (
         payload.pixel_pitch_m
@@ -1840,6 +1946,7 @@ def _validate_model_inputs(
     payload: PayloadConfig,
     environment: EnvironmentConfig,
     options: SNROptions,
+    stray_light: StrayLightConfig,
     absolute_magnitude: FloatArray,
     geometric_albedo: FloatArray,
     g12: FloatArray,
@@ -1937,6 +2044,28 @@ def _validate_model_inputs(
             "aperture_pixel_mode must be 'continuous' or 'ceil'."
         )
 
+    stray_angles = np.asarray(stray_light.off_axis_angle_deg, dtype=float)
+    stray_efficiency_values = np.asarray(stray_light.efficiency, dtype=float)
+    if stray_angles.ndim != 1 or stray_efficiency_values.ndim != 1:
+        raise ValueError("Stray-light curve arrays must be one-dimensional.")
+    if stray_angles.size < 2 or stray_angles.size != stray_efficiency_values.size:
+        raise ValueError("Stray-light curve arrays must have equal length >= 2.")
+    if np.any(~np.isfinite(stray_angles)) or np.any(np.diff(stray_angles) <= 0.0):
+        raise ValueError("Stray-light angles must be finite and strictly increasing.")
+    if np.any(~np.isfinite(stray_efficiency_values)) or np.any(stray_efficiency_values <= 0.0):
+        raise ValueError("Stray-light efficiencies must be finite and positive.")
+    if stray_light.interpolation != "log10":
+        raise ValueError("Only log10 stray-light interpolation is supported.")
+    if not isinstance(stray_light.hold_last_value, bool):
+        raise TypeError("stray_light.hold_last_value must be boolean.")
+    if stray_light.zero_at_angle_deg is not None:
+        zero_angle_deg = float(stray_light.zero_at_angle_deg)
+        if not np.isfinite(zero_angle_deg) or zero_angle_deg <= stray_angles[-1]:
+            raise ValueError(
+                "stray_light.zero_at_angle_deg must be finite and greater "
+                "than the final tabulated off-axis angle."
+            )
+
 
 def _evaluate_body_phase_law(
     body: BodyProperties,
@@ -1996,118 +2125,3 @@ def _angle_between(
     cosine = np.sum(v1 * v2, axis=-1) / (norm_1 * norm_2)
     cosine = np.clip(cosine, -1.0, 1.0)
     return np.asarray(np.arccos(cosine), dtype=float)
-
-
-# =============================================================================
-# EXAMPLE
-# =============================================================================
-
-if __name__ == "__main__":
-    # Example with three observation epochs. All Cartesian states are expressed
-    # in one Earth-centred inertial frame for illustration. The origin is
-    # arbitrary for this model, provided every position uses the same frame.
-
-
-    payload = PayloadConfig(
-        exposure_time_s=30.0,
-        aperture_diameter_m=0.10,
-        focal_length_m=0.30,
-        pixel_scale_arcsec_per_px=10.0,
-        pixel_pitch_m=15.0e-6,
-        psf_sigma_px=1.2,
-
-        # Scalars mean constant response over the complete band.
-        quantum_efficiency=0.80,
-        optical_throughput=0.70,
-
-        dark_current_e_per_s_px=0.01,
-        read_noise_e_rms_per_px=2.0,
-        background_surface_brightness_mag_arcsec2=22.0,
-
-        wavelength_lower_m=400.0e-9,
-        wavelength_upper_m=800.0e-9,
-        spectral_samples=2001,
-
-        # The zero point is the magnitude producing 1 electron per second.
-        zero_point_mag=23.0,
-    )
-
-    asteroid = AsteroidProperties(
-        absolute_magnitude=30.0,
-        geometric_albedo=0.14,
-        g12=0.40,
-    )
-
-    observer_position_km = np.array(
-        [
-            [-1.50e6, 0.0, 0.0],
-            [-1.50e6, 0.0, 0.0],
-            [-1.50e6, 0.0, 0.0],
-        ]
-    )
-    observer_velocity_km_s = np.array(
-        [
-            [0.0, -0.20, 0.0],
-            [0.0, -0.20, 0.0],
-            [0.0, -0.20, 0.0],
-        ]
-    )
-
-    asteroid_position_km = np.array(
-        [
-            [-1.20e6, 20_000.0, 5_000.0],
-            [-1.18e6, 26_000.0, 5_500.0],
-            [-1.16e6, 33_000.0, 6_000.0],
-        ]
-    )
-    asteroid_velocity_km_s = np.array(
-        [
-            [0.15, 0.45, 0.02],
-            [0.15, 0.45, 0.02],
-            [0.15, 0.45, 0.02],
-        ]
-    )
-
-    sun_position_km = np.array([-AU_KM, 0.0, 0.0])
-    earth_position_km = np.array([0.0, 0.0, 0.0])
-    moon_position_km = np.array([384_400.0, 0.0, 0.0])
-
-    # Point the payload at the asteroid at each observation epoch. Each
-    # boresight is treated as fixed during its corresponding exposure.
-    boresight = asteroid_position_km - observer_position_km
-    boresight /= np.linalg.norm(boresight, axis=-1, keepdims=True)
-
-    geometry = ObservationGeometry(
-        observer_position_km=observer_position_km,
-        observer_velocity_km_s=observer_velocity_km_s,
-        asteroid_position_km=asteroid_position_km,
-        asteroid_velocity_km_s=asteroid_velocity_km_s,
-        sun_position_km=sun_position_km,
-        earth_position_km=earth_position_km,
-        moon_position_km=moon_position_km,
-        boresight_unit_vector=boresight,
-    )
-
-    result = compute_asteroid_snr(
-        payload=payload,
-        asteroid=asteroid,
-        geometry=geometry,
-        environment=EnvironmentConfig(),
-        options=SNROptions(
-            aperture_pixel_mode="continuous",
-        ),
-    )
-
-    print("Asteroid SNR example")
-    print("--------------------")
-    for index in range(result.snr.size):
-        print(
-            f"Epoch {index}: "
-            f"SNR={result.snr[index]:.6g}, "
-            f"V={result.apparent_magnitude[index]:.3f}, "
-            f"omega={result.apparent_angular_speed_arcsec_s[index]:.3f} "
-            f"arcsec/s, "
-            f"trail={result.trail_length_px[index]:.3f} px, "
-            f"signal={result.signal_electrons[index]:.3e} e-, "
-            f"noise RMS={result.total_noise_rms_e[index]:.3e} e-"
-        )
