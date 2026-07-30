@@ -50,28 +50,31 @@ od_file_dir: 'OD_results'
 ####################################################
 # Spacecraft Specifications
 ###################################################
-pixel_scale: 1.27  # arcsec/pixel
-fov: 17.80  # degrees squared
-number_of_pixels: [ 11960, 11960 ]  # height x length
-reaction_wheel_torque: 0.0004  # Nm
-reaction_wheel_momentum: 0.015  # Nms
-mass: 50  # kg
+pixel_scale: 0.91  # arcsec/pixel
+# fov: 0.155848  # degrees squared
+fov: 17.8
+number_of_pixels: [ 2000, 1504 ]  # height x length
+reaction_wheel_torque: 0.007  # Nm
+reaction_wheel_momentum: 0.1  # Nms
+mass: 60  # kg
 length: 0.5  # m
-telescope_mass: 5  # kg
-telescope_diameter: 0.28  # m
-telescope_offset: 0.3  # m
-telescope_length: 0.3
-# sigma_ra: 981  # right ascension measurement uncertainty - mas
+telescope_mass: 12  # kg
+telescope_diameter: 0.35  # m
+telescope_offset: 0.0  # m
+telescope_length: 0.55 # this is actually telescope plus baffle
+# sigma_ra: 981  # right ascension measurement uncertainty - mas pix scale 0.66
 # sigma_dec: 939  # declination measurement uncertainty - mas
-sigma_ra: 1887  # right ascension measurement uncertainty - mas
-sigma_dec: 1806  # declination measurement uncertainty - mas
+# sigma_ra: 1887  # right ascension measurement uncertainty - mas pix scale 1.27
+# sigma_dec: 1806  # declination measurement uncertainty - mas
+sigma_ra: 1352  # right ascension measurement uncertainty - mas
+sigma_dec: 1294  # declination measurement uncertainty - mas
 sigma_pointing: 7200  # pointing uncertainty - mas
 #sigma_ra: 0.
 #sigma_dec: 0.
 #sigma_pointing: 500
 number_of_frames: 16  # the number of measurements expected from detection technique
-time_between_frames: 31.25 # the time between consecutive frames from detection technique, in seconds
-patch_time: 1.6  # time for detection algo to process one patch
+time_between_frames: 67 # the time between consecutive frames from detection technique, in seconds
+patch_time: 1.2  # time for detection algo to process one patch
 patch_size: [224, 224]  # height x length in pixels
 
 
@@ -84,9 +87,9 @@ patch_size: [224, 224]  # height x length in pixels
 payload_snr:
   schema_version: 1
   enabled: true
-  shadow_mode: false  # Calculate SNR but do not reject geometric detections yet.
+  shadow_mode: false  # true mean don't gate with snr Calculate SNR but do not reject geometric detections yet.
   chunk_size: 20000  # Maximum candidate epochs evaluated in one SNR batch.
-  snr_threshold: 3.0
+  snr_threshold: 0.00001
 
   optics:
     aperture_diameter_m: 0.198
@@ -164,6 +167,34 @@ quasi_halo_start: 140000  # index number where the quasi-halo orbit for Lisa pat
 quasi_halo_one_period_end: 247500  # index number where one 'period' of the orbit has been reached
 quasi_halo_end: 350500 # 355000  # practically  # esthetically 350500  # index number where lisa pathfinder exits quasi-halo orbit
 
+
+#####################################################
+# Initial detection boresight packing
+#####################################################
+initial_boresight_packing:
+
+  # Nominal initial-search direction in the geocentric SECR frame.
+  nominal_boresight_secr: [-1.0, 0.0, 0.0]
+
+  # Required angular clearance between the edge of the complete payload FOV
+  # and the edge of the dynamic Earth-Moon IV zone.
+  iv_clearance_margin_deg: 0.25
+
+  # Additional edge-to-edge angular separation between adjacent payload FOVs.
+  # The required centre-to-centre spacing is:
+  #   2 * FOV half-angle + this margin
+  fov_separation_margin_deg: 5.0
+
+  # Small numerical offset added beyond the analytical IV boundary when a
+  # boresight must be shifted outward.
+  outward_clearance_buffer_deg: 1.0e-4
+
+  # Angular step used only when searching farther outward to satisfy actual
+  # pairwise separation between spacecraft boresights.
+  packing_search_step_deg: 0.01
+
+  # Maximum permitted outward displacement from the nominal boresight.
+  max_outward_offset_deg: 15.0
 
 #####################################################
 # Asteroid parameters
@@ -296,6 +327,16 @@ IOD_HYPERPARAMETER:
     DELTA_RHO_DOT: [0.0033557046]
 
 
+timing:
+  # Fixed processing before the detection algorithm begins.
+  preprocessing_time_sec: 20.0
+
+  # Elapsed formation-level time for measurements to reach the mothership.
+  # Packet construction may be included here.
+  measurement_comm_time_sec: 120.0
+
+  # Elapsed formation-level time for boresight commands to reach the spacecraft.
+  boresight_comm_time_sec: 120.0
 
 ###########################################
 # Attitude Coordination Parameters

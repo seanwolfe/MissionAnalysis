@@ -42,7 +42,6 @@ def _set_reproducibility_seed(config):
 # generate data
 ###
 def generate_data(config, parameters, *, master_row=None, saved_as=None):
-    _set_reproducibility_seed(config)
     """
     Build inputs for the IOD solver using the per-row file(s) recorded in MASTER.
     One run per MASTER row.
@@ -62,6 +61,34 @@ def generate_data(config, parameters, *, master_row=None, saved_as=None):
        file_path,            # <- now chosen from MASTER
        observer_velocities)
     """
+    import hashlib
+    import random
+
+    base_seed = int(config.get("seed", 12345))
+
+    if master_row is not None:
+        row_key = "|".join([
+            str(master_row.get("ID_AST", "")),
+            str(master_row.get("DETECTING_SC_ID", "")),
+            str(master_row.get("INDEX_USED", "")),
+            str(master_row.get("IOD_DATA_SAVED_AS", "")),
+        ])
+    else:
+        row_key = str(
+            saved_as or parameters.get("MASTER_SAVED_AS", "")
+        )
+
+    digest = hashlib.sha256(row_key.encode("utf-8")).digest()
+    row_seed = (
+                       base_seed + int.from_bytes(digest[:8], byteorder="little")
+               ) % (2 ** 32)
+
+    random.seed(row_seed)
+    np.random.seed(row_seed)
+    torch.manual_seed(row_seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(row_seed)
 
     def _iod_dir(config):
         root = os.path.abspath(os.path.join(config['top_dir'], config['IOD_folder_path']))

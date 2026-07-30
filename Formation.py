@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
+import spiceypy as spice
 from Spacecraft import Spacecraft
+from earth_moon_invisibility_zone import query_moon_positions_geo_eme_km
 
 class Formation:
     def __init__(self, configs):
@@ -338,6 +340,92 @@ class Formation:
 
         return
 
+    def get_matched_spacecraft_positions_secr_km(self, configs):
+        """Return actual matched spacecraft positions in SECR kilometres.
+
+        ``match_spacecraft_trajectory_full`` stores position columns in AU even
+        though their legacy column names retain ``(km)``.  This helper performs
+        the conversion back to kilometres once and stacks the already-phased
+        spacecraft trajectories as ``(epochs, spacecraft, 3)``.
+        """
+        if not self.spacecraft:
+            raise RuntimeError("Formation contains no spacecraft.")
+
+        columns = [
+            'SUN_EARTH_CO_X_(km)',
+            'SUN_EARTH_CO_Y_(km)',
+            'SUN_EARTH_CO_Z_(km)',
+        ]
+        au_km = float(configs['AU_TO_M']) / float(configs['KM_TO_M'])
+        histories = []
+        expected_length = None
+
+        for sc_index, spacecraft in enumerate(self.spacecraft):
+            trajectory = spacecraft.matched_trajectory_full
+            if trajectory is None:
+                raise RuntimeError(
+                    "match_spacecraft_trajectory_full must be called before "
+                    "requesting matched SECR positions."
+                )
+            missing = [column for column in columns if column not in trajectory.columns]
+            if missing:
+                raise KeyError(
+                    f"SC{sc_index + 1} matched trajectory is missing {missing}."
+                )
+            values = trajectory.loc[:, columns].to_numpy(dtype=float) * au_km
+            if expected_length is None:
+                expected_length = len(values)
+            elif len(values) != expected_length:
+                raise ValueError(
+                    "All matched spacecraft trajectories must have equal length."
+                )
+            histories.append(values)
+
+        return np.stack(histories, axis=1)
+
+    def get_common_moon_positions_secr_km(
+        self,
+        configs,
+        reference_spacecraft_index=0,
+    ):
+        """Return the common matched Moon history in SECR kilometres.
+
+        The Moon history carried by the selected reference spacecraft is used
+        as the environmental phase for the complete formation realization.
+        Spacecraft positions remain individually phased, but every spacecraft
+        uses this same Moon position at a given matched array index.
+        """
+        if not self.spacecraft:
+            raise RuntimeError("Formation contains no spacecraft.")
+
+        reference_index = int(reference_spacecraft_index)
+        if not 0 <= reference_index < len(self.spacecraft):
+            raise IndexError(
+                "reference_spacecraft_index must identify an existing spacecraft."
+            )
+
+        trajectory = self.spacecraft[reference_index].matched_trajectory_full
+        if trajectory is None:
+            raise RuntimeError(
+                "match_spacecraft_trajectory_full must be called before "
+                "requesting the common Moon history."
+            )
+
+        columns = [
+            'MOON_SUN_EARTH_CO_X_(km)',
+            'MOON_SUN_EARTH_CO_Y_(km)',
+            'MOON_SUN_EARTH_CO_Z_(km)',
+        ]
+        missing = [column for column in columns if column not in trajectory.columns]
+        if missing:
+            raise KeyError(
+                "The matched reference trajectory is missing Moon SECR columns: "
+                f"{missing}."
+            )
+
+        au_km = float(configs['AU_TO_M']) / float(configs['KM_TO_M'])
+        return trajectory.loc[:, columns].to_numpy(dtype=float) * au_km
+
     def get_index_from_pos(self, position):
         possible_positions = self.orbit.loc[:, ['SUN_EARTH_CO_X_(km)', 'SUN_EARTH_CO_Y_(km)', 'SUN_EARTH_CO_Z_(km)']]
         distances = np.linalg.norm(possible_positions - position, axis=1)
@@ -491,119 +579,301 @@ class Formation:
         for j, sc_idx in enumerate(ids):
             all_sc[int(sc_idx)].boresight = boresights_eme[j, :]
 
-    def detect(self, asteroid_state, epoch, n_body_prop, configs):
-        """
-        Generate perfect and noisy RA/Dec measurements for each spacecraft over
-        a measurement window.
+    def detect(
+            self,
+            asteroid_state,
+            epoch,
+            n_body_prop,
+            configs,
+            *,
+            absolute_magnitude_h=None,
+            snr_evaluator=None,
+            moon_position_eme_km=None,
+    ):
+        """Generate one OD tracklet after single-epoch geometry/SNR gating.
 
-        Parameters
-        ----------
-        asteroid_state : array_like, shape (6,)
-            Asteroid EME/J2000 state at initial epoch [km, km/s].
-        epoch : float
-            Initial epoch in JDTDB.
-        n_body_prop : NBodyPropagator
-            Propagator instance.
-        configs : dict
-            Configuration dict containing at least:
-              - number_of_frames
-              - time_between_frames   [s]
-              - SECONDS_PER_DAY
-              - sigma_ra              [mas]
-              - sigma_dec             [mas]
-              - sigma_pointing        [mas]
+        Geometry remains the responsibility of
+        :meth:`Spacecraft.asteroid_in_fov_single_epoch`. Payload SNR is
+        evaluated here only for spacecraft that pass FOV, Earth/Moon physical
+        occultation, and the enabled dynamic Earth--Moon IV-zone test.
 
-        Returns
-        -------
-        perfect_meas : ndarray, shape (M, N, 2)
-            Perfect [RA, Dec] measurements in radians.
-        noisy_meas : ndarray, shape (M, N, 2)
-            Noisy [RA, Dec] measurements in radians.
-        sc_states : ndarray, shape (M, N, 6)
-            Propagated spacecraft states [km, km/s].
-        ast_states : ndarray, shape (N, 6)
-            Propagated asteroid states [km, km/s].
-        epochs : ndarray, shape (N,)
-            Epoch sequence used for measurements [JDTDB].
-        detection_results : list of dict
-            Initial per-spacecraft detection results.
+        ``payload_snr.enabled`` and ``payload_snr.shadow_mode`` retain the same
+        semantics as the initial-detection stage:
+
+        - disabled: geometry alone controls detection;
+        - shadow: SNR is calculated and reported, but geometry controls;
+        - gated: geometry and the configured SNR threshold must both pass.
+
+        The detectability test is applied at the initial tracklet epoch only;
+        accepted spacecraft generate the complete configured tracklet.
         """
 
         def mas_to_rad(x_mas):
-            """Convert milliarcseconds to radians."""
-            return np.asarray(x_mas, dtype=float) * np.pi / (180.0 * 3600.0 * 1000.0)
+            return (
+                np.asarray(x_mas, dtype=float)
+                * np.pi
+                / (180.0 * 3600.0 * 1000.0)
+            )
 
-        asteroid_state = np.asarray(asteroid_state, dtype=float).reshape(6,)
+        def result_field(result, field_name, count):
+            """Return one flattened result field with deterministic length."""
+            value = getattr(result, field_name, None)
+            if value is None:
+                return np.full(count, np.nan, dtype=float)
+            values = np.asarray(value, dtype=float)
+            if values.ndim == 0:
+                return np.full(count, float(values), dtype=float)
+            values = values.reshape(-1)
+            if values.size == 1 and count != 1:
+                return np.full(count, float(values[0]), dtype=float)
+            if values.size != count:
+                raise RuntimeError(
+                    f"SNR result field {field_name!r} has length "
+                    f"{values.size}; expected {count}."
+                )
+            return values
 
-        # ---------------------------------------------------------
-        # Initial detection check at the initial epoch
-        # ---------------------------------------------------------
+        asteroid_state = np.asarray(asteroid_state, dtype=float).reshape(6)
+        epoch = float(epoch)
+
+        payload_snr_cfg = configs.get("payload_snr", {}) or {}
+        snr_enabled = bool(payload_snr_cfg.get("enabled", False))
+        snr_shadow_mode = bool(payload_snr_cfg.get("shadow_mode", True))
+        snr_mode = (
+            "disabled"
+            if not snr_enabled
+            else ("shadow" if snr_shadow_mode else "gated")
+        )
+
+        if snr_enabled:
+            if snr_evaluator is None:
+                raise ValueError(
+                    "Formation.detect requires snr_evaluator when "
+                    "payload_snr.enabled is true."
+                )
+            if absolute_magnitude_h is None:
+                raise ValueError(
+                    "Formation.detect requires absolute_magnitude_h when "
+                    "payload_snr.enabled is true."
+                )
+            absolute_magnitude_h = float(absolute_magnitude_h)
+            if not np.isfinite(absolute_magnitude_h):
+                raise ValueError("absolute_magnitude_h must be finite.")
+
+        # One common Moon position is used by all spacecraft for both geometry
+        # and SNR at this OD opportunity.
+        if moon_position_eme_km is None:
+            common_moon_position_km = np.asarray(
+                query_moon_positions_geo_eme_km(epoch),
+                dtype=float,
+            ).reshape(3)
+        else:
+            common_moon_position_km = np.asarray(
+                moon_position_eme_km,
+                dtype=float,
+            ).reshape(3)
+        if not np.all(np.isfinite(common_moon_position_km)):
+            raise ValueError("The common Moon position must contain finite values.")
+
+        # Initial geometry check. Keep the original geometry flags intact and
+        # add separate SNR/active-detection diagnostics below.
         detection_results = [
-            sc.asteroid_in_fov_single_epoch(asteroid_state[:3], epoch, configs)
+            sc.asteroid_in_fov_single_epoch(
+                asteroid_state[:3],
+                epoch,
+                configs,
+                moon_position_eme_km=common_moon_position_km,
+            )
             for sc in self.spacecraft
         ]
 
+        for result in detection_results:
+            geometry_detected = bool(result.get("detected", False))
+            result["geometry_detected"] = geometry_detected
+            result["snr_mode"] = snr_mode
+            result["snr_evaluated"] = False
+            result["snr_pass"] = None
+            result["snr"] = np.nan
+            result["snr_threshold"] = (
+                float(getattr(snr_evaluator, "snr_threshold", np.nan))
+                if snr_enabled
+                else np.nan
+            )
+            result["apparent_magnitude"] = np.nan
+            result["apparent_angular_speed_arcsec_s"] = np.nan
+            result["trail_length_px"] = np.nan
+            result["active_detection"] = geometry_detected
+
+        geometry_candidate_indices = [
+            index
+            for index, result in enumerate(detection_results)
+            if bool(result["geometry_detected"])
+        ]
+
+        if snr_enabled and geometry_candidate_indices:
+            candidate_indices = np.asarray(
+                geometry_candidate_indices,
+                dtype=int,
+            )
+            candidate_count = int(candidate_indices.size)
+
+            et = spice.unitim(epoch, "JDTDB", "ET")
+            sun_state, _ = spice.spkgeo(10, et, "J2000", 399)
+            sun_position_km = np.asarray(sun_state[:3], dtype=float)
+            earth_position_km = np.zeros(3, dtype=float)
+
+            observer_states = np.vstack([
+                np.asarray(
+                    self.spacecraft[index].curr_state_eme,
+                    dtype=float,
+                ).reshape(6)
+                for index in candidate_indices
+            ])
+            boresights = np.vstack([
+                np.asarray(
+                    self.spacecraft[index].boresight,
+                    dtype=float,
+                ).reshape(3)
+                for index in candidate_indices
+            ])
+
+            snr_evaluation = snr_evaluator.evaluate_batch(
+                absolute_magnitude=np.full(
+                    candidate_count,
+                    absolute_magnitude_h,
+                    dtype=float,
+                ),
+                asteroid_position_km=np.broadcast_to(
+                    asteroid_state[:3],
+                    (candidate_count, 3),
+                ),
+                asteroid_velocity_km_s=np.broadcast_to(
+                    asteroid_state[3:],
+                    (candidate_count, 3),
+                ),
+                observer_position_km=observer_states[:, :3],
+                observer_velocity_km_s=observer_states[:, 3:],
+                sun_position_km=np.broadcast_to(
+                    sun_position_km,
+                    (candidate_count, 3),
+                ),
+                earth_position_km=np.broadcast_to(
+                    earth_position_km,
+                    (candidate_count, 3),
+                ),
+                moon_position_km=np.broadcast_to(
+                    common_moon_position_km,
+                    (candidate_count, 3),
+                ),
+                boresight_unit_vector=boresights,
+            )
+
+            pass_mask = np.asarray(
+                snr_evaluation.pass_mask,
+                dtype=bool,
+            ).reshape(-1)
+            if pass_mask.size == 1 and candidate_count != 1:
+                pass_mask = np.full(
+                    candidate_count,
+                    bool(pass_mask[0]),
+                    dtype=bool,
+                )
+            if pass_mask.size != candidate_count:
+                raise RuntimeError(
+                    "SNR pass-mask length does not match the number of "
+                    f"geometry candidates: {pass_mask.size} versus "
+                    f"{candidate_count}."
+                )
+
+            snr_values = result_field(
+                snr_evaluation.result,
+                "snr",
+                candidate_count,
+            )
+            apparent_magnitude = result_field(
+                snr_evaluation.result,
+                "apparent_magnitude",
+                candidate_count,
+            )
+            apparent_speed = result_field(
+                snr_evaluation.result,
+                "apparent_angular_speed_arcsec_s",
+                candidate_count,
+            )
+            trail_length_px = result_field(
+                snr_evaluation.result,
+                "trail_length_px",
+                candidate_count,
+            )
+
+            for local_index, spacecraft_index in enumerate(candidate_indices):
+                result = detection_results[int(spacecraft_index)]
+                result["snr_evaluated"] = True
+                result["snr_pass"] = bool(pass_mask[local_index])
+                result["snr"] = float(snr_values[local_index])
+                result["apparent_magnitude"] = float(
+                    apparent_magnitude[local_index]
+                )
+                result["apparent_angular_speed_arcsec_s"] = float(
+                    apparent_speed[local_index]
+                )
+                result["trail_length_px"] = float(
+                    trail_length_px[local_index]
+                )
+
+        # Promote SNR into the active detection decision only in gated mode.
+        for result in detection_results:
+            geometry_detected = bool(result["geometry_detected"])
+            if snr_enabled and not snr_shadow_mode:
+                active_detection = bool(
+                    geometry_detected and result.get("snr_pass", False)
+                )
+            else:
+                active_detection = geometry_detected
+            result["active_detection"] = active_detection
+            result["detected"] = active_detection
+
         M = len(self.spacecraft)
 
-        # ---------------------------------------------------------
-        # Build spacecraft initial state array (M,6)
-        # ---------------------------------------------------------
         sc_initial_states = np.zeros((M, 6), dtype=float)
         for i, sc in enumerate(self.spacecraft):
-            sc_initial_states[i, :] = np.asarray(sc.curr_state_eme, dtype=float).reshape(6,)
+            sc_initial_states[i, :] = np.asarray(
+                sc.curr_state_eme,
+                dtype=float,
+            ).reshape(6)
 
-        # ---------------------------------------------------------
-        # Measurement sequence
-        # ---------------------------------------------------------
         num_frames = int(configs["number_of_frames"])
-        step_days = float(configs["time_between_frames"]) / float(configs["SECONDS_PER_DAY"])
+        step_days = (
+            float(configs["time_between_frames"])
+            / float(configs["SECONDS_PER_DAY"])
+        )
         epochs = epoch + step_days * np.arange(num_frames, dtype=float)
 
-        # ---------------------------------------------------------
-        # Propagate asteroid and spacecraft over the same epoch grid
-        # ---------------------------------------------------------
-        # asteroid: (N,6)
         ast_states = n_body_prop.propagate(asteroid_state, epoch, epochs)
-
-        # spacecraft: (N,M,6) from your propagator
         sc_states_time_major = n_body_prop.propagate_multiple_objects(
-            sc_initial_states, epoch, epochs
+            sc_initial_states,
+            epoch,
+            epochs,
         )
-
-        # reorder to (M,N,6) for convenience
         sc_states = np.transpose(sc_states_time_major, (1, 0, 2))
 
         N = num_frames
-
-        # ---------------------------------------------------------
-        # Allocate outputs
-        # ---------------------------------------------------------
         perfect_meas = np.full((M, N, 2), np.nan, dtype=float)
         noisy_meas = np.full((M, N, 2), np.nan, dtype=float)
 
-        # ---------------------------------------------------------
-        # Effective noise sigmas (all inputs in mas)
-        # ---------------------------------------------------------
         sigma_ra_rad = mas_to_rad(configs.get("sigma_ra", 0.0))
         sigma_dec_rad = mas_to_rad(configs.get("sigma_dec", 0.0))
-        sigma_pointing_rad = mas_to_rad(configs.get("sigma_pointing", 0.0))
-
+        sigma_pointing_rad = mas_to_rad(
+            configs.get("sigma_pointing", 0.0)
+        )
         sigma_ra_eff = np.sqrt(sigma_ra_rad**2 + sigma_pointing_rad**2)
         sigma_dec_eff = np.sqrt(sigma_dec_rad**2 + sigma_pointing_rad**2)
 
-        eps = 1e-12
-
-        # ---------------------------------------------------------
-        # Per-spacecraft measurement generation
-        # ---------------------------------------------------------
+        eps = 1.0e-12
         for i in range(M):
-            detected = bool(detection_results[i].get("detected", False))
-
-            # If not detected at initial epoch, keep all-NaN for this spacecraft
-            if not detected:
+            if not bool(detection_results[i].get("detected", False)):
                 continue
 
-            # Relative position asteroid - spacecraft over all frames
             x_rel = ast_states[:, 0] - sc_states[i, :, 0]
             y_rel = ast_states[:, 1] - sc_states[i, :, 1]
             z_rel = ast_states[:, 2] - sc_states[i, :, 2]
@@ -611,26 +881,41 @@ class Formation:
             r_xy = np.hypot(x_rel, y_rel)
             r = np.sqrt(r_xy**2 + z_rel**2)
 
-            # Perfect RA/Dec
             ra = np.arctan2(y_rel, x_rel)
-            dec = np.arcsin(np.clip(z_rel / np.maximum(r, eps), -1.0, 1.0))
+            dec = np.arcsin(
+                np.clip(
+                    z_rel / np.maximum(r, eps),
+                    -1.0,
+                    1.0,
+                )
+            )
 
             perfect_meas[i, :, 0] = ra
             perfect_meas[i, :, 1] = dec
 
-            # Add Gaussian noise directly in RA/Dec
-            ra_noisy = ra + np.random.normal(loc=0.0, scale=sigma_ra_eff, size=N)
-            dec_noisy = dec + np.random.normal(loc=0.0, scale=sigma_dec_eff, size=N)
-
-            # Wrap RA to [-pi, pi)
+            ra_noisy = ra + np.random.normal(
+                loc=0.0,
+                scale=sigma_ra_eff,
+                size=N,
+            )
+            dec_noisy = dec + np.random.normal(
+                loc=0.0,
+                scale=sigma_dec_eff,
+                size=N,
+            )
             ra_noisy = np.arctan2(np.sin(ra_noisy), np.cos(ra_noisy))
 
             noisy_meas[i, :, 0] = ra_noisy
             noisy_meas[i, :, 1] = dec_noisy
 
-        return perfect_meas, noisy_meas, sc_states, ast_states, epochs, detection_results
-
-
+        return (
+            perfect_meas,
+            noisy_meas,
+            sc_states,
+            ast_states,
+            epochs,
+            detection_results,
+        )
 
 
 

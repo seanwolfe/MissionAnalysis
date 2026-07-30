@@ -14,6 +14,7 @@ from matplotlib.patches import Patch
 from typing import Dict, Any, Tuple, Optional, List
 from dataclasses import dataclass
 import utilities as util
+from earth_moon_invisibility_zone import compute_earth_moon_invisibility_zone_batch
 
 
 # -----------------------------
@@ -61,6 +62,109 @@ def softplus(z, beta=1.0):
     """Numerically stable softplus: (1/beta) * log(1 + exp(beta*z))."""
     z_beta = beta * z
     return (1.0 / beta) * np.log1p(np.exp(z_beta))
+
+
+def _keepout_is_active(p_em, R_em):
+    """Return True when a legacy or virtual-sphere keepout is active."""
+    if p_em is None or R_em is None:
+        return False
+    radii = np.asarray(R_em, dtype=float)
+    return bool(radii.size > 0 and np.any(np.isfinite(radii) & (radii > 0.0)))
+
+
+def _select_keepout_geometry(p_em, R_em, agent_index, n_agents):
+    """Select one agent's keepout center/radius from shared or per-agent inputs.
+
+    ``p_em`` may be ``(3,)`` or ``(M,3)`` and ``R_em`` may be scalar or
+    ``(M,)``.  The per-agent form is used by the dynamic Earth--Moon IV-zone
+    path, where each spacecraft has its own bisector axis.
+    """
+    if not _keepout_is_active(p_em, R_em):
+        return None, 0.0
+
+    centers = np.asarray(p_em, dtype=float)
+    if centers.shape == (3,):
+        center = centers
+    elif centers.shape == (int(n_agents), 3):
+        center = centers[int(agent_index)]
+    else:
+        raise ValueError(
+            f"p_em must have shape (3,) or ({int(n_agents)},3), got {centers.shape}."
+        )
+
+    radii = np.asarray(R_em, dtype=float)
+    if radii.ndim == 0:
+        radius = float(radii)
+    elif radii.shape == (int(n_agents),):
+        radius = float(radii[int(agent_index)])
+    else:
+        raise ValueError(
+            f"R_em must be scalar or have shape ({int(n_agents)},), got {radii.shape}."
+        )
+
+    return np.asarray(center, dtype=float).reshape(3,), radius
+
+
+def _dynamic_iv_virtual_spheres(
+    p_agents_ts,
+    moon_position_ts,
+    earth_position_ts,
+    half_angle_deg,
+    *,
+    virtual_distance=1.0e6,
+):
+    """Convert dynamic IV cones into exact per-agent virtual-sphere cones.
+
+    The legacy optimizer expresses keepout as the apparent angular radius of a
+    sphere.  For each spacecraft/epoch we place a virtual sphere along the
+    dynamic Earth--Moon bisector axis at distance ``D`` and use radius
+    ``D sin(theta_IV)``.  Its apparent angular radius is exactly
+    ``theta_IV`` for ``theta_IV < 90 deg``.  This retains the mature optimizer
+    while replacing the old quasi-constant ``p_em``/``R_em`` geometry.
+    """
+    p_agents_ts = np.asarray(p_agents_ts, dtype=float)
+    if p_agents_ts.ndim != 3 or p_agents_ts.shape[2] != 3:
+        raise ValueError(
+            f"p_agents_ts must have shape (N,M,3), got {p_agents_ts.shape}."
+        )
+    N, M, _ = p_agents_ts.shape
+
+    moon = np.asarray(moon_position_ts, dtype=float)
+    earth = np.asarray(earth_position_ts, dtype=float)
+    if moon.shape == (3,):
+        moon = np.broadcast_to(moon, (N, 3)).copy()
+    if earth.shape == (3,):
+        earth = np.broadcast_to(earth, (N, 3)).copy()
+    if moon.shape != (N, 3) or earth.shape != (N, 3):
+        raise ValueError(
+            "moon_position and earth_position must have shape (3,) or (N,3); "
+            f"got moon={moon.shape}, earth={earth.shape}."
+        )
+
+    half_angle_rad = float(np.deg2rad(float(half_angle_deg)))
+    if not 0.0 <= half_angle_rad < 0.5 * np.pi:
+        raise ValueError(
+            "The dynamic IV virtual-sphere representation requires "
+            "ems.half_angle_deg in [0, 90)."
+        )
+
+    sc_flat = p_agents_ts.reshape(N * M, 3)
+    earth_flat = np.repeat(earth, M, axis=0)
+    moon_flat = np.repeat(moon, M, axis=0)
+    zone = compute_earth_moon_invisibility_zone_batch(
+        spacecraft_position=sc_flat,
+        earth_position=earth_flat,
+        moon_position=moon_flat,
+        half_angle_deg=float(half_angle_deg),
+    )
+    axes = np.asarray(zone.axis_geo_eme, dtype=float).reshape(N, M, 3)
+
+    D = float(virtual_distance)
+    if not np.isfinite(D) or D <= 0.0:
+        raise ValueError("ems.dynamic_virtual_distance must be positive and finite.")
+    centers = p_agents_ts + D * axes
+    radii = np.full((N, M), D * np.sin(half_angle_rad), dtype=float)
+    return centers, radii, axes, half_angle_rad
 
 
 # -----------------------------------------------------------
@@ -309,9 +413,7 @@ def mean_pointing_full_uncertainty_cover_flags(
     p_samples = (Lp @ y_samples.T).T + p_hat[None, :]
     cos_theta_h = float(np.cos(theta_h))
 
-    use_keepout = (p_em is not None) and (float(R_em) > 0.0)
-    if use_keepout:
-        p_em = np.asarray(p_em, dtype=float).reshape(3,)
+    use_keepout = _keepout_is_active(p_em, R_em)
 
     for i in range(M):
         r_mean = p_hat - p_agents[i]
@@ -331,10 +433,12 @@ def mean_pointing_full_uncertainty_cover_flags(
         if theta_req[i] > float(theta_s_list[i]) + 1e-12:
             continue
 
-        if use_keepout and not keepout_safe_single(
-            p_agents[i], u_des, float(theta_h), p_em, float(R_em), float(alpha_s)
-        ):
-            continue
+        if use_keepout:
+            p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, i, M)
+            if not keepout_safe_single(
+                p_agents[i], u_des, float(theta_h), p_em_i, R_em_i, float(alpha_s)
+            ):
+                continue
 
         v = p_samples - p_agents[i][None, :]
         v_norm = np.linalg.norm(v, axis=1, keepdims=True)
@@ -379,7 +483,10 @@ def ems_exclusion_penalty(
     total = 0.0
 
     for i in range(M):
-        r = p_em - p_agents[i]
+        p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, i, M)
+        if p_em_i is None or R_em_i <= 0.0:
+            continue
+        r = p_em_i - p_agents[i]
         dist = np.linalg.norm(r)
         if dist < 1e-12:
             # Degenerate: s/c at EMS center; skip or heavily penalize if desired
@@ -388,7 +495,7 @@ def ems_exclusion_penalty(
         u_em = r / dist
 
         # α^{EM}_i = arcsin(R_EM / ||r||), clipped
-        ratio = np.clip(R_em / dist, -1.0, 1.0)
+        ratio = np.clip(R_em_i / dist, -1.0, 1.0)
         alpha_em = np.arcsin(ratio)
 
         angle_req = theta_h + alpha_em + alpha_s
@@ -527,7 +634,7 @@ def objective_joint_free(
     )
     obj = -J
 
-    if lambda_em != 0.0 and p_em is not None and R_em > 0.0:
+    if lambda_em != 0.0 and _keepout_is_active(p_em, R_em):
         obj += ems_exclusion_penalty(
             p_agents, u_agents,
             p_em=p_em, R_em=R_em,
@@ -575,7 +682,7 @@ def objective_joint(x, p_hat, P_p, p_agents, u_curr_agents,
     obj = -J
 
     # EMS exclusion penalty (only if configured)
-    if lambda_em != 0.0 and p_em is not None and R_em > 0.0:
+    if lambda_em != 0.0 and _keepout_is_active(p_em, R_em):
         penalty_em = ems_exclusion_penalty(
             p_agents, u_agents,
             p_em=p_em, R_em=R_em,
@@ -1055,19 +1162,20 @@ def init_theta_phi_boundary_projection(
 
         return [], []
 
-    def keepout_safe_single_local(p_i, u_i):
-        if p_em is None or float(R_em) <= 0.0:
+    def keepout_safe_single_local(p_i, u_i, agent_index):
+        p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, agent_index, M)
+        if p_em_i is None or R_em_i <= 0.0:
             return True
 
-        r_vec = p_em - p_i
+        r_vec = p_em_i - p_i
         r_norm = np.linalg.norm(r_vec)
 
-        if r_norm < R_em + eps:
+        if r_norm < R_em_i + eps:
             return False
 
         v_em = r_vec / r_norm
         gamma = np.arccos(np.clip(np.dot(u_i, v_em), -1.0, 1.0))
-        alpha_em = np.arcsin(np.clip(R_em / r_norm, -1.0, 1.0))
+        alpha_em = np.arcsin(np.clip(R_em_i / r_norm, -1.0, 1.0))
 
         return gamma >= (theta_h + alpha_em + alpha_s)
 
@@ -1159,7 +1267,7 @@ def init_theta_phi_boundary_projection(
             e2_list[i],
         )
 
-        if not keepout_safe_single_local(p_agents[i], u_j):
+        if not keepout_safe_single_local(p_agents[i], u_j, i):
             return u_i, theta_i, phi_i
 
         if require_ellipsoid_hit:
@@ -1319,7 +1427,7 @@ def init_theta_phi_boundary_projection(
 
         u_i = theta_phi_to_u(theta, phi, u_curr, e1, e2)
 
-        ems_ok = keepout_safe_single_local(p_i, u_i)
+        ems_ok = keepout_safe_single_local(p_i, u_i, i)
         if log_candidate:
             candidate_log.append({
                 "stage": stage,
@@ -1694,8 +1802,9 @@ def init_theta_phi_boundary_projection(
         if u_i_star is None:
             u_i_star = u_curr
 
-        # If no EMS is active, keep mean/current fallback.
-        if p_em is None or float(R_em) <= 0.0:
+        # If no EMS/IV keepout is active, keep mean/current fallback.
+        p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, i, M)
+        if p_em_i is None or R_em_i <= 0.0:
             candidate_u_list.append([u_i_star])
             candidate_log.append({
                 "stage": "fallback",
@@ -1707,10 +1816,10 @@ def init_theta_phi_boundary_projection(
             })
             continue
 
-        r_vec = p_em - p_i
+        r_vec = p_em_i - p_i
         r_norm = np.linalg.norm(r_vec)
 
-        if r_norm < R_em + eps:
+        if r_norm < R_em_i + eps:
             candidate_u_list.append([u_i_star])
             candidate_log.append({
                 "stage": "fallback",
@@ -1723,7 +1832,7 @@ def init_theta_phi_boundary_projection(
             continue
 
         v_em = r_vec / r_norm
-        alpha_em = np.arcsin(np.clip(R_em / r_norm, -1.0, 1.0))
+        alpha_em = np.arcsin(np.clip(R_em_i / r_norm, -1.0, 1.0))
         gamma_bound = float(theta_h + alpha_em + alpha_s)
 
         if gamma_bound >= np.pi - 1e-6:
@@ -1738,7 +1847,7 @@ def init_theta_phi_boundary_projection(
             })
             continue
 
-        if keepout_safe_single_local(p_i, u_i_star):
+        if keepout_safe_single_local(p_i, u_i_star, i):
             candidate_u_list.append([u_i_star])
             candidate_log.append({
                 "stage": "fallback",
@@ -2133,10 +2242,8 @@ def optimize_pointing_lbfgs_joint(
 
         M = p_agents.shape[0]
 
-        if p_em is None or float(R_em) <= 0.0:
+        if not _keepout_is_active(p_em, R_em):
             return np.ones(M, dtype=bool)
-
-        p_em = np.asarray(p_em, dtype=float).reshape(3, )
 
         rng = np.random.default_rng(seed)
 
@@ -2154,16 +2261,17 @@ def optimize_pointing_lbfgs_joint(
 
         for i in range(M):
             p_i = p_agents[i]
+            p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, i, M)
 
-            r_em = p_em - p_i
+            r_em = p_em_i - p_i
             r_em_norm = np.linalg.norm(r_em)
 
-            if r_em_norm < R_em + eps:
+            if r_em_norm < R_em_i + eps:
                 visible_ems[i] = False
                 continue
 
             v_em = r_em / r_em_norm
-            alpha_em = np.arcsin(np.clip(R_em / r_em_norm, -1.0, 1.0))
+            alpha_em = np.arcsin(np.clip(R_em_i / r_em_norm, -1.0, 1.0))
             gamma_min = theta_h + alpha_em + alpha_s
 
             r = p_shell - p_i[None, :]
@@ -2634,8 +2742,12 @@ class AttitudeCoordinator:
         self.display=bool(opt.get("display", False))
         self.num_candidates=int(opt.get("num_candidates", 8))
 
-        # Optional EMS / keepout config defaults
+        # Dynamic Earth--Moon IV-zone defaults. Legacy p_em/R_em remain as a
+        # compatibility fallback only when no Moon/IV-axis history is supplied.
         ems = cfg.get("ems", {})
+        self.ems_enabled = bool(ems.get("enabled", False))
+        self.iv_half_angle_deg = float(ems.get("half_angle_deg", 0.0))
+        self.dynamic_virtual_distance = float(ems.get("dynamic_virtual_distance", 1.0e6))
         self.p_em_default = np.array(ems.get("p_em", [0.0, 0.0, 0.0]), dtype=float)
         self.R_em_default = float(ems.get("R_em", 0.0))
         self.alpha_s_default = np.deg2rad(float(ems.get("alpha_s_deg", 0.0)))
@@ -2688,7 +2800,12 @@ class AttitudeCoordinator:
         *,
         d_M: Optional[float] = None,
         trial_seed: int = 0,
-        # EMS params
+        # Dynamic IV-zone inputs. Moon/Earth positions may be static (3,) or
+        # time-varying (N,3).  iv_axes may be supplied directly as (M,3) or
+        # (N,M,3). Legacy p_em/R_em are fallback-only.
+        moon_position: Optional[np.ndarray] = None,
+        earth_position: Optional[np.ndarray] = None,
+        iv_axes: Optional[np.ndarray] = None,
         p_em: Optional[np.ndarray] = None,
         R_em: Optional[float] = None,
         alpha_s: Optional[float] = None,
@@ -2760,14 +2877,6 @@ class AttitudeCoordinator:
         if d_M is None:
             d_M = float(self.cfg.get("covariance", {}).get("d_mahal", 1.0))
 
-        # EMS defaults
-        if p_em is None:
-            p_em = self.p_em_default
-        else:
-            p_em = np.asarray(p_em, dtype=float).reshape(3,)
-
-        if R_em is None:
-            R_em = self.R_em_default
         if alpha_s is None:
             alpha_s = self.alpha_s_default
         if lambda_em is None:
@@ -2779,6 +2888,78 @@ class AttitudeCoordinator:
         p_agents_ts = self._broadcast_time_series(p_agents, N, (M, 3))
         p_hat_ts = self._broadcast_time_series(p_hat, N, (3,))
         P_p_ts = self._broadcast_time_series(P_p, N, (3, 3))
+
+        # Build one dynamic Earth--Moon IV cone per spacecraft and candidate
+        # epoch.  The Moon/Earth history is common to the formation; the axis
+        # differs by spacecraft because observer position differs.
+        dynamic_iv_axes_ts = None
+        dynamic_iv_half_angle_rad = float("nan")
+        if self.ems_enabled:
+            if iv_axes is not None:
+                axes = np.asarray(iv_axes, dtype=float)
+                if axes.shape == (M, 3):
+                    dynamic_iv_axes_ts = np.broadcast_to(axes, (N, M, 3)).copy()
+                elif axes.shape == (N, M, 3):
+                    dynamic_iv_axes_ts = axes
+                else:
+                    raise ValueError(
+                        f"iv_axes must have shape ({M},3) or ({N},{M},3), got {axes.shape}."
+                    )
+                norms = np.linalg.norm(dynamic_iv_axes_ts, axis=2)
+                if np.any(norms <= 1.0e-15):
+                    raise ValueError("iv_axes contains zero-length vectors.")
+                dynamic_iv_axes_ts = dynamic_iv_axes_ts / norms[:, :, None]
+                dynamic_iv_half_angle_rad = float(np.deg2rad(self.iv_half_angle_deg))
+                if not 0.0 <= dynamic_iv_half_angle_rad < 0.5 * np.pi:
+                    raise ValueError(
+                        "The dynamic IV virtual-sphere representation requires "
+                        "ems.half_angle_deg in [0, 90)."
+                    )
+                D = self.dynamic_virtual_distance
+                p_em_ts = p_agents_ts + D * dynamic_iv_axes_ts
+                R_em_ts = np.full((N, M), D * np.sin(dynamic_iv_half_angle_rad), dtype=float)
+            else:
+                if moon_position is None:
+                    raise ValueError(
+                        "Dynamic IV-zone attitude coordination requires moon_position "
+                        "or explicit iv_axes when ems.enabled is true."
+                    )
+                if earth_position is None:
+                    earth_position = np.zeros((N, 3), dtype=float)
+                p_em_ts, R_em_ts, dynamic_iv_axes_ts, dynamic_iv_half_angle_rad = (
+                    _dynamic_iv_virtual_spheres(
+                        p_agents_ts,
+                        moon_position,
+                        earth_position,
+                        self.iv_half_angle_deg,
+                        virtual_distance=self.dynamic_virtual_distance,
+                    )
+                )
+        else:
+            # Legacy compatibility path for callers that explicitly supply a
+            # sphere while the dynamic EMS switch is disabled.
+            if p_em is None:
+                p_em = self.p_em_default
+            if R_em is None:
+                R_em = self.R_em_default
+            if _keepout_is_active(p_em, R_em):
+                p_em_arr = np.asarray(p_em, dtype=float)
+                R_em_arr = np.asarray(R_em, dtype=float)
+                if p_em_arr.shape == (3,):
+                    p_em_ts = np.broadcast_to(p_em_arr, (N, 3)).copy()
+                elif p_em_arr.shape == (M, 3):
+                    p_em_ts = np.broadcast_to(p_em_arr, (N, M, 3)).copy()
+                else:
+                    raise ValueError("Legacy p_em must be (3,) or (M,3).")
+                if R_em_arr.ndim == 0:
+                    R_em_ts = np.full(N, float(R_em_arr))
+                elif R_em_arr.shape == (M,):
+                    R_em_ts = np.broadcast_to(R_em_arr, (N, M)).copy()
+                else:
+                    raise ValueError("Legacy R_em must be scalar or (M,).")
+            else:
+                p_em_ts = None
+                R_em_ts = None
 
         # coverage_point may be static or time-varying
         covpt_ts = None
@@ -2802,6 +2983,8 @@ class AttitudeCoordinator:
             p_agents_k = p_agents_ts[k]
             p_hat_k = p_hat_ts[k].reshape(3,)
             P_p_k = P_p_ts[k]
+            p_em_k = None if p_em_ts is None else p_em_ts[k]
+            R_em_k = None if R_em_ts is None else R_em_ts[k]
 
             # Slew limit for this dt
             theta_s_t = float(theta_s_of_dt(dt, alpha_max, omega_max))
@@ -2842,10 +3025,13 @@ class AttitudeCoordinator:
                     fixed_agent_feasible_k = False
                     fixed_agent_infeasible_reason = "fixed_anchor_slew_infeasible"
 
-                if fixed_agent_feasible_k and p_em is not None and float(R_em) > 0.0:
+                if fixed_agent_feasible_k and _keepout_is_active(p_em_k, R_em_k):
+                    p_em_fix, R_em_fix = _select_keepout_geometry(
+                        p_em_k, R_em_k, idx_fix_i, M
+                    )
                     if not keepout_safe_single(
                         p_agents_k[idx_fix_i], fixed_agent_u_k, float(theta_h),
-                        p_em, float(R_em), float(alpha_s)
+                        p_em_fix, R_em_fix, float(alpha_s)
                     ):
                         fixed_agent_feasible_k = False
                         fixed_agent_infeasible_reason = "fixed_anchor_ems_infeasible"
@@ -2879,6 +3065,8 @@ class AttitudeCoordinator:
                         fixed_agent_feasible=False,
                         fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                         fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                        iv_half_angle_rad=dynamic_iv_half_angle_rad,
+                        iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
                     ))
                     continue
 
@@ -2891,7 +3079,7 @@ class AttitudeCoordinator:
                 n_mc=int(self.n_mc),
                 seed=int(trial_seed),
                 n_restarts=int(self.n_restarts),
-                p_em=p_em, R_em=float(R_em),
+                p_em=p_em_k, R_em=R_em_k,
                 alpha_s=float(alpha_s),
                 lambda_em=float(lambda_em),
                 beta_zeta=float(beta_zeta),
@@ -2924,6 +3112,42 @@ class AttitudeCoordinator:
                     fixed_agent_feasible=bool(fixed_agent_feasible_k),
                     fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                     fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                    iv_half_angle_rad=dynamic_iv_half_angle_rad,
+                    iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
+                ))
+                continue
+
+            # Hard dynamic-IV feasibility check. The smooth optimizer penalty
+            # helps steer the solution, but no command is accepted unless the
+            # complete FOV cone clears the IV zone for every spacecraft.
+            iv_safe_flags = np.ones(M, dtype=bool)
+            if _keepout_is_active(p_em_k, R_em_k):
+                for i in range(M):
+                    p_em_i, R_em_i = _select_keepout_geometry(
+                        p_em_k, R_em_k, i, M
+                    )
+                    iv_safe_flags[i] = keepout_safe_single(
+                        p_agents_k[i], u_star[i], float(theta_h),
+                        p_em_i, R_em_i, float(alpha_s)
+                    )
+            if not bool(np.all(iv_safe_flags)):
+                opt_series.append(dict(
+                    k=k, dt=dt, feasible=False,
+                    u=None,
+                    cost=float("nan"),
+                    J=float("nan"),
+                    theta_req_avg_deg=float("nan"),
+                    theta_s_allowed=float(theta_s_t),
+                    coverage=-1,
+                    history=history,
+                    fixed_agent_idx=(None if fixed_agent_idx_k is None else int(fixed_agent_idx_k)),
+                    fixed_agent_u_mode=fixed_agent_mode_k,
+                    fixed_agent_feasible=bool(fixed_agent_feasible_k),
+                    fixed_agent_infeasible_reason="optimized_iv_infeasible",
+                    fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                    iv_half_angle_rad=dynamic_iv_half_angle_rad,
+                    iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
+                    iv_safe_flags=iv_safe_flags.copy(),
                 ))
                 continue
 
@@ -2962,6 +3186,9 @@ class AttitudeCoordinator:
                 fixed_agent_feasible=bool(fixed_agent_feasible_k),
                 fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                 fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                iv_half_angle_rad=dynamic_iv_half_angle_rad,
+                iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
+                iv_safe_flags=iv_safe_flags.copy(),
             )
             opt_series.append(row)
 
@@ -3013,6 +3240,8 @@ class AttitudeCoordinator:
             dt = float(dt)
             p_agents_k = p_agents_ts[k]
             p_hat_k = p_hat_ts[k].reshape(3,)
+            p_em_k = None if p_em_ts is None else p_em_ts[k]
+            R_em_k = None if R_em_ts is None else R_em_ts[k]
 
             all_ok, per_ok, u_mean, theta_req, theta_s_t = all_agents_can_point_to_mean(
                 dt,
@@ -3020,7 +3249,7 @@ class AttitudeCoordinator:
                 p_agents_k, u_curr_agents,
                 float(theta_h),
                 float(alpha_max), float(omega_max),
-                p_em, float(R_em), float(alpha_s),
+                p_em_k, R_em_k, float(alpha_s),
             )
 
             if not all_ok:
@@ -3140,6 +3369,10 @@ def keepout_safe_single(p_sc, u_boresight, theta_h, p_em, R_em, alpha_s, eps=1e-
       gamma    = angle between boresight and direction-to-EMS-center
       alpha_em = apparent half-angle of EMS sphere from spacecraft = asin(R_em / d)
     """
+    if p_em is None or R_em is None or float(R_em) <= 0.0:
+        return True
+    p_em = np.asarray(p_em, dtype=float).reshape(3,)
+    R_em = float(R_em)
     r_em = p_em - p_sc
     d = np.linalg.norm(r_em)
     if d < eps:
@@ -3204,8 +3437,6 @@ def all_agents_can_point_to_mean(
     p_hat_t = np.asarray(p_hat_t, dtype=float).reshape(3,)
     p_agents = np.asarray(p_agents, dtype=float)
     u_curr_agents = np.asarray(u_curr_agents, dtype=float)
-    p_em = np.asarray(p_em, dtype=float).reshape(3,)
-
     if p_agents.ndim != 2 or p_agents.shape[1] != 3:
         raise ValueError(f"p_agents must be (M,3), got {p_agents.shape}")
     if u_curr_agents.shape != p_agents.shape:
@@ -3233,10 +3464,14 @@ def all_agents_can_point_to_mean(
             per_ok[i] = False
             continue
 
-        # Keep-out constraint (EMS exclusion)
-        if not keepout_safe_single(p_agents[i], u_des, float(theta_h), p_em, float(R_em), float(alpha_s)):
-            per_ok[i] = False
-            continue
+        # Keep-out constraint (dynamic IV exclusion or legacy sphere).
+        if _keepout_is_active(p_em, R_em):
+            p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, i, M)
+            if not keepout_safe_single(
+                p_agents[i], u_des, float(theta_h), p_em_i, R_em_i, float(alpha_s)
+            ):
+                per_ok[i] = False
+                continue
 
         per_ok[i] = True
 

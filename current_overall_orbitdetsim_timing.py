@@ -20,7 +20,7 @@ import gc
 import glob
 import datetime as dt
 import matplotlib.pyplot as plt
-from od_attcoord_coverage_mode_v2_tracking_anchor_emsfree import AttitudeCoordinator, compute_J_grid_theta_phi_single_free
+from od_attcoord_coverage_mode_v2_tracking_anchor_dynamic_iv import AttitudeCoordinator, compute_J_grid_theta_phi_single_free
 import math
 import time
 from datetime import datetime
@@ -29,6 +29,8 @@ import pickle
 import itertools
 import hashlib
 from payload_snr_adapter import PayloadSNREvaluator
+from initial_boresight_packing import compute_initial_boresight_history
+from earth_moon_invisibility_zone import query_moon_positions_geo_eme_km
 
 # Load SPICE kernels (Ensure you downloaded DE440 as mentioned before)
 sp.furnsh("de430.bsp")
@@ -104,6 +106,10 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
     base_dir = config['top_dir']
     base_name = os.path.basename(base_out)
     out_dir = os.path.join(base_dir, config["visible_files_folder"])
+    boresight_ephemeris_dir = os.path.join(
+        base_dir,
+        "initial_boresight_ephemerides",
+    )
 
     snr_diag_dir = None
     if snr_diag_enabled:
@@ -118,6 +124,7 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
 
     if rank == 0:
         os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(boresight_ephemeris_dir, exist_ok=True)
         if snr_diag_dir is not None:
             os.makedirs(snr_diag_dir, exist_ok=True)
     comm.Barrier()  # ensure directories exist before others write
@@ -141,6 +148,7 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
         "combined_survival_fraction",
         "max_snr", "first_snr_pass_index",
         "snr_at_first_geometry_epoch", "snr_diagnostic_file",
+        "boresight_ephemeris_file",
         "total_length", "spacecraft_1_ini_pos"
     ]
     df_buffer = pd.DataFrame(columns=cols)
@@ -234,20 +242,129 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
         jdtdb_epochs = current_minimoon.orbit["Julian Date"]
         formation.match_spacecraft_trajectory_full(len(ast_traj[:, 0]), config)
 
-        # set boresights
-        earth_helio_ae = np.array(current_minimoon.orbit.loc[:, ["Earth x (Helio)", "Earth y (Helio)", "Earth z (Helio)",
-                         "Earth vx (Helio)", "Earth vy (Helio)", "Earth vz (Helio)"]])
-        earth_helio_ae[:, :3] *= (config["AU_TO_M"] / config["KM_TO_M"])
-        earth_helio_ae[:, 3:] *= (config["AU_TO_M"] / config["KM_TO_M"] / config["SECONDS_PER_DAY"])
-        boresight_ini_secr = np.zeros((len(earth_helio_ae[:, 0]), 3))
-        boresight_ini_secr[:, 0] = -1
-        boresight_ini_eclip = util.geo_secr_to_geo_eclip_generic(boresight_ini_secr, earth_helio_ae,
-                                                                 obj_hint=('time', 'position'),
-                                                                 earth_hint=('time', 'state'))
-        boresight_ini_eme = util.geo_eclip_to_geo_eme_generic(boresight_ini_eclip,
-                                                              hint=('time', 'position'))
+        # -------------------------------------------------------------
+        # Compute the complete initial-search boresight ephemeris exactly
+        # once for this formation realization.  The already-matched and
+        # already-phased spacecraft trajectories define the formation
+        # geometry.  SC1's matched Moon history is the common environmental
+        # Moon history for planning, detection, and SNR.
+        # -------------------------------------------------------------
+        earth_helio_ae = np.array(
+            current_minimoon.orbit.loc[
+                :,
+                [
+                    "Earth x (Helio)",
+                    "Earth y (Helio)",
+                    "Earth z (Helio)",
+                    "Earth vx (Helio)",
+                    "Earth vy (Helio)",
+                    "Earth vz (Helio)",
+                ],
+            ],
+            dtype=float,
+        )
+        earth_helio_ae[:, :3] *= (
+            config["AU_TO_M"] / config["KM_TO_M"]
+        )
+        earth_helio_ae[:, 3:] *= (
+            config["AU_TO_M"]
+            / config["KM_TO_M"]
+            / config["SECONDS_PER_DAY"]
+        )
 
-        
+        spacecraft_positions_secr_km = (
+            formation.get_matched_spacecraft_positions_secr_km(config)
+        )
+        common_moon_secr_km = formation.get_common_moon_positions_secr_km(
+            config,
+            reference_spacecraft_index=0,
+        )
+
+        boresight_solution = compute_initial_boresight_history(
+            spacecraft_positions_secr_km=spacecraft_positions_secr_km,
+            moon_positions_secr_km=common_moon_secr_km,
+            config=config,
+        )
+        boresights_secr = np.asarray(
+            boresight_solution.boresights_secr,
+            dtype=float,
+        )
+        if boresights_secr.shape != (
+            len(ast_traj),
+            num_sc,
+            3,
+        ):
+            raise RuntimeError(
+                "Initial boresight history has unexpected shape: "
+                f"{boresights_secr.shape}; expected "
+                f"({len(ast_traj)}, {num_sc}, 3)."
+            )
+
+        # Transform each spacecraft's direction history from SECR to EME.
+        boresights_eme = np.empty_like(boresights_secr)
+        for sc_index in range(num_sc):
+            boresight_eclip = util.geo_secr_to_geo_eclip_generic(
+                boresights_secr[:, sc_index, :],
+                earth_helio_ae,
+                obj_hint=("time", "position"),
+                earth_hint=("time", "state"),
+            )
+            boresights_eme[:, sc_index, :] = (
+                util.geo_eclip_to_geo_eme_generic(
+                    boresight_eclip,
+                    hint=("time", "position"),
+                )
+            )
+
+        # Transform the same common Moon history for detection and SNR.
+        common_moon_eclip_km = util.geo_secr_to_geo_eclip_generic(
+            common_moon_secr_km,
+            earth_helio_ae,
+            obj_hint=("time", "position"),
+            earth_hint=("time", "state"),
+        )
+        common_moon_eme_km = util.geo_eclip_to_geo_eme_generic(
+            common_moon_eclip_km,
+            hint=("time", "position"),
+        )
+
+        # Persist the SECR ephemeris once so the IOD stage can store the exact
+        # formation boresights at INDEX_USED without rerunning the planner.
+        safe_object_id = _safe_filename_component(current_minimoon.id)
+        boresight_ephemeris_name = (
+            f"initial_boresight_run-{run_no}_object-{safe_object_id}_"
+            f"task-{mm_idx}.npz"
+        )
+        boresight_ephemeris_path = os.path.join(
+            boresight_ephemeris_dir,
+            boresight_ephemeris_name,
+        )
+        np.savez_compressed(
+            boresight_ephemeris_path,
+            boresights_secr=boresights_secr,
+            offsets_rad=np.asarray(boresight_solution.offsets_rad, dtype=float),
+            iv_clearance_rad=np.asarray(
+                boresight_solution.iv_clearance_rad,
+                dtype=float,
+            ),
+            nominal_clearance_rad=np.asarray(
+                boresight_solution.nominal_clearance_rad,
+                dtype=float,
+            ),
+            inward_count=np.asarray(
+                boresight_solution.inward_count,
+                dtype=int,
+            ),
+            spacecraft_initial_indices=np.asarray(
+                [spacecraft.ini_pos_index for spacecraft in formation.spacecraft],
+                dtype=int,
+            ),
+        )
+        boresight_ephemeris_file = os.path.relpath(
+            boresight_ephemeris_path,
+            base_dir,
+        )
+
         new_rows = []
         for jdx, spacecraft in enumerate(formation.spacecraft):
         
@@ -261,7 +378,11 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
         
             # new
             # get s/c eme traj at ast epoch
-            sc_traj = util.sc_eme_ast_eme(sc_df=spacecraft.matched_trajectory_full, earth_ast_kms_array=earth_helio_ae)
+            sc_traj = util.sc_eme_ast_eme(
+                sc_df=spacecraft.matched_trajectory_full,
+                earth_ast_kms_array=earth_helio_ae,
+            )
+            spacecraft_boresight_eme = boresights_eme[:, jdx, :]
 
             # Evaluate cumulative geometric detection masks.
             (
@@ -271,9 +392,10 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
             ) = spacecraft.asteroid_in_fov_batch_km_geocentric(
                 ast_traj[:, :3],
                 sc_traj[:, :3],
-                boresight_ini_eme,
+                spacecraft_boresight_eme,
                 jdtdb_epochs,
                 config,
+                moon_positions_eme_km=common_moon_eme_km,
             )
 
             mask_fov = np.asarray(mask_fov, dtype=bool)
@@ -333,8 +455,9 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
                 (
                     sun_position_km,
                     earth_position_km,
-                    moon_position_km,
+                    _moon_position_spice_km,
                 ) = _body_positions_geo_eme_km(candidate_epochs)
+                moon_position_km = common_moon_eme_km[candidate_idx]
 
                 geometry_kwargs = {
                     "absolute_magnitude": absolute_magnitude_h,
@@ -345,7 +468,9 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
                     "sun_position_km": sun_position_km,
                     "earth_position_km": earth_position_km,
                     "moon_position_km": moon_position_km,
-                    "boresight_unit_vector": boresight_ini_eme[candidate_idx],
+                    "boresight_unit_vector": spacecraft_boresight_eme[
+                        candidate_idx
+                    ],
                 }
 
                 if candidate_idx.size > snr_chunk_size:
@@ -572,6 +697,7 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
                 "first_snr_pass_index": first_snr_pass_index,
                 "snr_at_first_geometry_epoch": snr_at_first_geometry_epoch,
                 "snr_diagnostic_file": snr_diagnostic_file,
+                "boresight_ephemeris_file": boresight_ephemeris_file,
                 "total_length": len(mask_fov),
                 "spacecraft_1_ini_pos": tuple(
                     formation.spacecraft[0].ini_position
@@ -961,16 +1087,88 @@ def run_sim_runnumbers_MPI_getIOD(config):
 
         # -------- per-rank buffer of master rows --------
         master_rows_buffer = []
+        boresight_ephemeris_cache = {}
 
         if len(my_chunk) > 0:
             # new augmented DF
-            detected_appended_pop_chunk = util.get_scs_initial_states_new(my_chunk, config)
+            detected_appended_pop_chunk = util.get_scs_initial_states_new(
+                my_chunk,
+                config,
+            )
+            if "boresight_ephemeris_file" not in detected_appended_pop_chunk.columns:
+                if "boresight_ephemeris_file" not in my_chunk.columns:
+                    raise KeyError(
+                        "Visible detection rows do not contain "
+                        "'boresight_ephemeris_file'. Rerun the initial "
+                        "detection stage with integrated boresight packing."
+                    )
+                aligned_ephemeris_files = my_chunk[
+                    "boresight_ephemeris_file"
+                ].reindex(detected_appended_pop_chunk.index)
+                if aligned_ephemeris_files.isna().any():
+                    raise RuntimeError(
+                        "Could not align boresight ephemeris references with "
+                        "the augmented IOD rows."
+                    )
+                detected_appended_pop_chunk[
+                    "boresight_ephemeris_file"
+                ] = aligned_ephemeris_files.to_numpy()
 
             for _, detected_minimoon in detected_appended_pop_chunk.iterrows():
                 mm_id = detected_minimoon.name[1]
                 sc_id = detected_minimoon.name[2]
 
                 idx0 = int(detected_minimoon["index_used"])
+
+                # Load the already-computed formation boresight ephemeris and
+                # select the exact SECR boresight set at INDEX_USED.  This
+                # avoids rerunning the planner during IOD preparation.
+                ephemeris_value = detected_minimoon.get(
+                    "boresight_ephemeris_file",
+                    "",
+                )
+                if pd.isna(ephemeris_value) or str(ephemeris_value).strip() == "":
+                    raise ValueError(
+                        "Missing boresight_ephemeris_file for detected row "
+                        f"object={mm_id}, spacecraft={sc_id}."
+                    )
+                ephemeris_path = str(ephemeris_value)
+                if not os.path.isabs(ephemeris_path):
+                    ephemeris_path = os.path.join(top_dir, ephemeris_path)
+                ephemeris_path = os.path.abspath(ephemeris_path)
+
+                if ephemeris_path not in boresight_ephemeris_cache:
+                    if not os.path.isfile(ephemeris_path):
+                        raise FileNotFoundError(
+                            "Initial boresight ephemeris not found: "
+                            f"{ephemeris_path}"
+                        )
+                    with np.load(ephemeris_path, allow_pickle=False) as ephemeris:
+                        history = np.asarray(
+                            ephemeris["boresights_secr"],
+                            dtype=float,
+                        )
+                    if history.ndim != 3 or history.shape[1:] != (num_sc, 3):
+                        raise ValueError(
+                            "Invalid boresights_secr shape in "
+                            f"{ephemeris_path}: {history.shape}; expected "
+                            f"(epochs, {num_sc}, 3)."
+                        )
+                    boresight_ephemeris_cache[ephemeris_path] = history
+
+                boresight_history_secr = boresight_ephemeris_cache[
+                    ephemeris_path
+                ]
+                if not 0 <= idx0 < boresight_history_secr.shape[0]:
+                    raise IndexError(
+                        f"INDEX_USED={idx0} is outside boresight ephemeris "
+                        f"length {boresight_history_secr.shape[0]}."
+                    )
+                boresights_at_index_secr = boresight_history_secr[idx0]
+                for sc_number in range(1, num_sc + 1):
+                    detected_minimoon[f"SC{sc_number}_boresight"] = (
+                        boresights_at_index_secr[sc_number - 1].copy()
+                    )
 
                 file_name = f"minimoon-{mm_id}_sc-{int(sc_id)}_index-{idx0}_{src_base}"
                 base_path = os.path.join(data_done_dir, file_name)
@@ -2316,6 +2514,10 @@ def run_OD(config_global):
       - Outer-loop log is the primary analysis log.
       - Inner KF / att-coord / optimizer logs are optional detailed logs.
       - Resume is append-safe and replays deterministically unless you later add full state snapshots.
+      - Candidate epochs include configured preprocessing, measurement-crosslink,
+        and boresight-command-crosslink delays through SimTime.
+      - Ordinary no-detection classification occurs only after collection,
+        preprocessing, and detection processing have elapsed.
     """
 
     # --- MPI setup ---
@@ -2341,6 +2543,26 @@ def run_OD(config_global):
     comm.Barrier()
     if not os.path.exists(master_fn):
         return
+
+    # Build one reusable payload-SNR evaluator per MPI rank for all OD rows.
+    # The enabled/shadow/gated semantics match the initial-detection stage.
+    od_payload_snr_cfg = config_global.get("payload_snr", {}) or {}
+    od_snr_enabled = bool(od_payload_snr_cfg.get("enabled", False))
+    od_snr_shadow_mode = bool(
+        od_payload_snr_cfg.get("shadow_mode", True)
+    )
+    od_snr_mode = (
+        "disabled"
+        if not od_snr_enabled
+        else ("shadow" if od_snr_shadow_mode else "gated")
+    )
+    od_snr_evaluator = None
+    if od_snr_enabled:
+        od_snr_evaluator = PayloadSNREvaluator.from_config(
+            config_global,
+            config_path=config_global.get("__config_path__"),
+            base_dir=config_global.get("__config_dir__"),
+        )
 
     # Rank 0: inspect MASTER and broadcast row count
     if rank == 0:
@@ -3719,12 +3941,13 @@ def run_OD(config_global):
 
         occluded = int(row["OCCLUDED_BY_EMS"]) == 1
 
+        # The dynamic IV zone remains active throughout OD. The initial IOD
+        # epoch flag is context only and must not disable the later,
+        # time-varying Earth--Moon keepout geometry.
         if occluded:
-            config["ems"]["R_em"] = 0.0
-            config["ems"]["alpha_s_deg"] = 0.0
-            print("Doing OD without EMS Exclusion...")
+            print("Initial IOD epoch was IV-occluded; retaining dynamic IV exclusion during OD.")
         else:
-            print("Doing OD with EMS Exclusion")
+            print("Initial IOD epoch was IV-clear; using dynamic IV exclusion during OD.")
 
         saved_as_str = str(row.get("IOD_DATA_SAVED_AS", "") or "")
         uid = uid_from_saved_as(saved_as_str, m_idx)
@@ -3744,6 +3967,22 @@ def run_OD(config_global):
         row_paused_for_walltime = False
 
         try:
+            # The asteroid absolute magnitude is needed only when OD SNR is
+            # enabled. It is carried forward from the initial-detection/IOD
+            # MASTER row.
+            absolute_magnitude_h = None
+            if od_snr_enabled:
+                if "TBO_H" not in row.index or pd.isna(row["TBO_H"]):
+                    raise ValueError(
+                        "OD payload SNR is enabled, but the MASTER row has no "
+                        "finite TBO_H value."
+                    )
+                absolute_magnitude_h = float(row["TBO_H"])
+                if not np.isfinite(absolute_magnitude_h):
+                    raise ValueError(
+                        "OD payload SNR is enabled, but TBO_H is non-finite."
+                    )
+
             # ----------------------------------------------
             # Setup from iod
             # ---------------------------------------------
@@ -3845,9 +4084,9 @@ def run_OD(config_global):
             if att_coord_viz_flag_ini_ini:
 
                 theta_h_rad = util.fov_deg2_to_half_angle_rad(config["fov"])
-                ems_center_xy = np.array(config["ems"]["p_em"][:2])
-                ems_center_xyz = np.array(config["ems"]["p_em"])
-                ems_radius = config["ems"]['R_em']
+                ems_center_xy = np.zeros(2, dtype=float)  # legacy EMS-sphere overlay disabled
+                ems_center_xyz = np.zeros(3, dtype=float)  # legacy EMS-sphere overlay disabled
+                ems_radius = 0.0  # dynamic IV cone is not represented by a legacy sphere
                 ray_length = config['ray_length']
 
                 sc_eme_ae_kms = formation.get_spacecraft_states()[:, :3]
@@ -3889,7 +4128,7 @@ def run_OD(config_global):
                     show_coverage=True,
                     show_uncertainty=True,
                     show_truth=True,
-                    show_ems=True,
+                    show_ems=False,
                     show_fov_cones=True,
                     title="3D OD Scenario Demo (EME)",
                     slew_history=None,
@@ -4171,6 +4410,16 @@ def run_OD(config_global):
                         x_ts, P_ts, sc_eme_states_kms_piecewise, ast_eme_traj_kms, num_sc
                     )
 
+                    # One common Moon position per candidate epoch is shared by
+                    # the formation. The coordinator then computes a separate
+                    # dynamic IV axis for each spacecraft from its own position.
+                    attcoord_moon_positions_eme_km = query_moon_positions_geo_eme_km(
+                        timer.attcoord_searchtimes_jdtdb
+                    )
+                    attcoord_earth_positions_eme_km = np.zeros_like(
+                        attcoord_moon_positions_eme_km
+                    )
+
                     ast_truth_original_eclip = np.array(minimoon.orbit.loc[:, ["Geo x", "Geo y", "Geo z", "Geo vx",
                                                                                "Geo vy", "Geo vz"]])
                     ast_truth_original_eclip[:, :3] *= config['AU_TO_M'] / 1000
@@ -4240,6 +4489,8 @@ def run_OD(config_global):
                         sc_pointings_eme[initial_detecting_list, :] if len(initial_detecting_list) > 0 else np.empty((0, 3)),
                         initial_detecting_list,
                         d_M=config['d_mahal'],
+                        moon_position=attcoord_moon_positions_eme_km,
+                        earth_position=attcoord_earth_positions_eme_km,
                         use_fixed_agent=True,
                         fixed_agent_idx=int(initial_detecting_list[0]),
                         fixed_agent_u=sc_pointings_eme[int(initial_detecting_list[0]), :],
@@ -4292,9 +4543,9 @@ def run_OD(config_global):
                         best_idx = np.where(timer.attcoord_searchtimes == best_epoch)[0]
 
                         theta_h_rad = util.fov_deg2_to_half_angle_rad(config["fov"])
-                        ems_center_xy = np.array(config["ems"]["p_em"][:2])
-                        ems_center_xyz = np.array(config["ems"]["p_em"])
-                        ems_radius = config["ems"]['R_em']
+                        ems_center_xy = np.zeros(2, dtype=float)  # legacy EMS-sphere overlay disabled
+                        ems_center_xyz = np.zeros(3, dtype=float)  # legacy EMS-sphere overlay disabled
+                        ems_radius = 0.0  # dynamic IV cone is not represented by a legacy sphere
                         ray_length = config['ray_length']
 
                         sc_eme_ae_kms = np.squeeze(sc_eme_states_kms_piecewise[best_idx, :, :3])
@@ -4476,7 +4727,7 @@ def run_OD(config_global):
                             show_coverage=True,
                             show_uncertainty=True,
                             show_truth=True,
-                            show_ems=True,
+                            show_ems=False,
                             show_fov_cones=True,
                             title="3D OD Scenario Demo (EME)",
                             slew_history=slew_history,
@@ -4598,8 +4849,8 @@ def run_OD(config_global):
                             best_idx = np.where(timer.attcoord_searchtimes == best_epoch)[0]
 
                             theta_h_rad = util.fov_deg2_to_half_angle_rad(config["fov"])
-                            ems_center_xyz = np.array(config["ems"]["p_em"])
-                            ems_radius = config["ems"]['R_em']
+                            ems_center_xyz = np.zeros(3, dtype=float)  # legacy EMS-sphere overlay disabled
+                            ems_radius = 0.0  # dynamic IV cone is not represented by a legacy sphere
                             ray_length = config['ray_length']
 
                             sc_eme_ae_kms = np.squeeze(sc_eme_states_kms_piecewise[best_idx, :, :3])
@@ -4680,7 +4931,7 @@ def run_OD(config_global):
                                 ems_radius=ems_radius,
                                 show_uncertainty=True,
                                 show_truth=True,  # green circle
-                                show_ems=True,
+                                show_ems=False,
                                 show_fov_cones=True,
                                 show_legend=True,
                                 show_target_mean_traj=True,
@@ -4752,14 +5003,16 @@ def run_OD(config_global):
                         minimoon.curr_state_eme,
                         timer.curr_epoch,
                         n_body_propagator,
-                        config
+                        config,
+                        absolute_magnitude_h=absolute_magnitude_h,
+                        snr_evaluator=od_snr_evaluator,
                     )
 
                     # optional visualization block unchanged
                     confirm_meas = False
                     if confirm_meas:
-                        ems_center_xyz = np.array(config["ems"]["p_em"])
-                        ems_radius = config["ems"]['R_em']
+                        ems_center_xyz = np.zeros(3, dtype=float)  # legacy EMS-sphere overlay disabled
+                        ems_radius = 0.0  # dynamic IV cone is not represented by a legacy sphere
                         util.plot_detection_geometry_3d(
                             perfect_meas=p_meas_k,
                             noisy_meas=n_meas_k,
@@ -4772,7 +5025,7 @@ def run_OD(config_global):
                             # EMS sphere
                             ems_center_xyz=ems_center_xyz,
                             ems_radius=ems_radius,
-                            show_ems=True,
+                            show_ems=False,
                             ems_alpha=0.10,
                             show_ems_wires=True,
                             title="Detection Geometry",
@@ -5091,6 +5344,76 @@ def run_OD(config_global):
                         od_stop_reason = "no_detection_continue"
 
                     if terminate_for_object_lost:
+                        # An ordinary no-detection result is not available at the
+                        # tracklet start. Advance the filter, truth, spacecraft, and
+                        # authoritative timer to the end of collection + preprocessing
+                        # + detection processing before classifying the object as lost.
+                        no_detection_decision_epoch = float(
+                            timer.get_no_detection_decision_epoch()
+                        )
+                        decision_targets = _validate_piecewise_targets_in_minimoon_orbit(
+                            timer,
+                            minimoon,
+                            np.asarray([no_detection_decision_epoch], dtype=float),
+                            min_points=1,
+                            context="ordinary_no_detection_decision",
+                        )
+                        no_detection_decision_epoch = float(decision_targets[-1])
+
+                        filter_epoch = (
+                            float(processed_epoch_last)
+                            if np.isfinite(processed_epoch_last)
+                            else float(timer.curr_epoch)
+                        )
+                        if no_detection_decision_epoch > filter_epoch + 1.0e-15:
+                            ukf.predict(
+                                filter_epoch,
+                                no_detection_decision_epoch,
+                                n_body_propagator.propagate_multiple_objects,
+                            )
+
+                        ast_no_detection = n_body_propagator.propagate(
+                            minimoon.curr_state_eme,
+                            timer.curr_epoch,
+                            decision_targets,
+                        )
+                        ast_no_detection = np.asarray(
+                            ast_no_detection, dtype=float
+                        ).reshape(-1, 6)
+
+                        sc_no_detection, anchor_info_no_detection = (
+                            util.piecewise_anchor_and_propagate_spacecraft_trajs(
+                                formation=formation,
+                                minimoon=minimoon,
+                                timer=timer,
+                                t_targets_jdtdb=decision_targets,
+                                n_body_propagator=n_body_propagator,
+                                return_anchor_info=True,
+                            )
+                        )
+                        sc_no_detection = np.asarray(
+                            sc_no_detection, dtype=float
+                        ).reshape(1, num_sc, 6)
+
+                        formation.set_spacecraft_states(sc_no_detection[0, :, :])
+                        # Pointings remain unchanged because no attitude coordination
+                        # or boresight-command transmission is performed.
+                        minimoon.set_state(ast_no_detection[0, :])
+
+                        k_anchor_no_detection = int(
+                            anchor_info_no_detection["anchor_k_of_t"][0]
+                        )
+                        t_anchor_no_detection = float(
+                            anchor_info_no_detection["anchor_epoch_of_t"][0]
+                        )
+                        timer.set_attcoord_time(0.0)
+                        timer.set_slew_time(0.0)
+                        timer.step(
+                            no_detection_decision_epoch,
+                            k_anchor_no_detection,
+                            t_anchor_no_detection,
+                        )
+
                         termination_reason = no_detection_reason
                         progress_status = "completed"
 
@@ -5112,7 +5435,7 @@ def run_OD(config_global):
                             "event_type": event_type,
                             "termination_reason": termination_reason,
                             "epoch_start_jdtdb": epoch_start,
-                            "epoch_end_jdtdb": float(processed_epoch_last) if np.isfinite(processed_epoch_last) else epoch_start,
+                            "epoch_end_jdtdb": float(timer.curr_epoch),
                             "processed_epoch_first_jdtdb": processed_epoch_first,
                             "processed_epoch_last_jdtdb": processed_epoch_last,
                             "processed_epoch_count": processed_epoch_count,
@@ -5438,7 +5761,16 @@ def run_OD(config_global):
                     # -------------------------------------------------------
                     attcoord_startime = time.time()
 
-                    timer.set_attcoord_searchtimes(od_time=od_time)
+                    # A normal measurement update includes measurement crosslink and
+                    # OD computation delay. A no-detection reacquisition attempt begins
+                    # after collection/preprocessing/detection and omits those two terms.
+                    measurements_available_for_cycle = bool(
+                        had_detection and int(n_detections) > 0
+                    )
+                    timer.set_attcoord_searchtimes(
+                        od_time=(od_time if measurements_available_for_cycle else None),
+                        measurements_available=measurements_available_for_cycle,
+                    )
                     _validate_attcoord_search_grid(timer, min_attcoord_points, context="attcoord")
                     _trim_attcoord_grid_to_minimoon_orbit(
                         timer, minimoon, min_points=min_attcoord_points, context="attcoord"
@@ -5459,6 +5791,13 @@ def run_OD(config_global):
                     ast_eme_state_kms = minimoon.curr_state_eme
                     ast_eme_traj_kms = n_body_propagator.propagate(ast_eme_state_kms, timer.curr_epoch,
                                                                    timer.attcoord_searchtimes_jdtdb)
+
+                    attcoord_moon_positions_eme_km = query_moon_positions_geo_eme_km(
+                        timer.attcoord_searchtimes_jdtdb
+                    )
+                    attcoord_earth_positions_eme_km = np.zeros_like(
+                        attcoord_moon_positions_eme_km
+                    )
 
                     ast_truth_original_eclip = np.array(minimoon.orbit.loc[:, ["Geo x", "Geo y", "Geo z", "Geo vx",
                                                                                "Geo vy", "Geo vz"]])
@@ -5543,6 +5882,8 @@ def run_OD(config_global):
                             detecting_u,
                             detecting_list,
                             d_M=config['d_mahal'],
+                            moon_position=attcoord_moon_positions_eme_km,
+                            earth_position=attcoord_earth_positions_eme_km,
                             use_fixed_agent=bool(use_anchor),
                             fixed_agent_idx=(None if not use_anchor else int(anchor_sid)),
                             fixed_agent_u=fixed_u,
@@ -5584,6 +5925,8 @@ def run_OD(config_global):
                             detecting_u,
                             detecting_list,
                             d_M=config['d_mahal'],
+                            moon_position=attcoord_moon_positions_eme_km,
+                            earth_position=attcoord_earth_positions_eme_km,
                             use_fixed_agent=False,
                             fixed_agent_idx=None,
                             fixed_agent_u=None,
@@ -5717,9 +6060,9 @@ def run_OD(config_global):
                         best_idx = np.where(timer.attcoord_searchtimes == best_epoch)[0]
 
                         theta_h_rad = util.fov_deg2_to_half_angle_rad(config["fov"])
-                        ems_center_xy = np.array(config["ems"]["p_em"][:2])
-                        ems_center_xyz = np.array(config["ems"]["p_em"])
-                        ems_radius = config["ems"]['R_em']
+                        ems_center_xy = np.zeros(2, dtype=float)  # legacy EMS-sphere overlay disabled
+                        ems_center_xyz = np.zeros(3, dtype=float)  # legacy EMS-sphere overlay disabled
+                        ems_radius = 0.0  # dynamic IV cone is not represented by a legacy sphere
                         ray_length = config['ray_length']
 
                         sc_eme_ae_kms = np.squeeze(sc_eme_states_kms_piecewise[best_idx, :, :3])
@@ -5910,7 +6253,7 @@ def run_OD(config_global):
                             ems_radius=ems_radius,
                             show_uncertainty=True,
                             show_truth=True,  # green circle
-                            show_ems=True,
+                            show_ems=False,
                             show_fov_cones=True,
                             show_legend=True,
                             show_target_mean_traj=True,
@@ -6080,8 +6423,8 @@ def run_OD(config_global):
                             best_idx = np.where(timer.attcoord_searchtimes == best_epoch)[0]
 
                             theta_h_rad = util.fov_deg2_to_half_angle_rad(config["fov"])
-                            ems_center_xyz = np.array(config["ems"]["p_em"])
-                            ems_radius = config["ems"]['R_em']
+                            ems_center_xyz = np.zeros(3, dtype=float)  # legacy EMS-sphere overlay disabled
+                            ems_radius = 0.0  # dynamic IV cone is not represented by a legacy sphere
                             ray_length = config['ray_length']
 
                             sc_eme_ae_kms = np.squeeze(sc_eme_states_kms_piecewise[best_idx, :, :3])
@@ -6163,7 +6506,7 @@ def run_OD(config_global):
                                 ems_radius=ems_radius,
                                 show_uncertainty=True,
                                 show_truth=True,  # green circle
-                                show_ems=True,
+                                show_ems=False,
                                 show_fov_cones=True,
                                 show_legend=True,
                                 show_target_mean_traj=True,
