@@ -127,6 +127,9 @@ class PayloadSNREvaluator:
         )
 
         environment = EnvironmentConfig(
+            astronomical_unit_km=float(
+                environment_cfg["astronomical_unit_km"]
+            ),
             solar_radius_km=float(environment_cfg["solar_radius_km"]),
             solar_temperature_k=float(environment_cfg["solar_temperature_k"]),
             earth=_body_from_mapping(environment_cfg["earth"]),

@@ -1,15 +1,10 @@
 
 import numpy as np
-import spiceypy as spice
 from earth_moon_invisibility_zone import (
     compute_earth_moon_invisibility_zone_batch,
     line_of_sight_inside_invisibility_zone,
-    query_moon_positions_geo_eme_km,
 )
 
-# Load SPICE kernels once per process.
-spice.furnsh("de430.bsp")
-spice.furnsh("naif0012.tls")
 
 class Spacecraft:
 
@@ -20,7 +15,9 @@ class Spacecraft:
         self.velocity = None
         self.position = None
         self.boresight = np.array([-1, 0, 0]) if current_boresight is None else current_boresight
-        self.pixel_scale = configs['pixel_scale']
+        self.pixel_scale = float(
+            configs['payload_snr']['optics']['pixel_scale_arcsec_per_px']
+        )
         self.fov = configs['fov']
         self.number_of_pixels = configs['number_of_pixels']
         self.reaction_wheel_torque = configs['reaction_wheel_torque']
@@ -236,7 +233,8 @@ class Spacecraft:
             asteroid_position_km,
             jdtdb,
             configs,
-            moon_position_eme_km=None,
+            *,
+            moon_position_eme_km,
     ):
         """Single-epoch detectability in geocentric EME/J2000 coordinates.
 
@@ -244,9 +242,9 @@ class Spacecraft:
         physically occulted by Earth or the Moon, and outside the dynamic
         Earth--Moon invisibility-zone cone when that cone is enabled.
 
-        ``moon_position_eme_km`` may provide one common Moon position for the
-        complete formation at this epoch. When omitted, the legacy direct-SPICE
-        query is retained as a fallback.
+        ``moon_position_eme_km`` is required and must be the one common
+        physical Moon position selected by the caller for this simulation
+        epoch.  This method never chooses or interpolates an ephemeris source.
         """
 
         def fov_deg2_to_half_angle_rad(fov_deg2):
@@ -285,17 +283,14 @@ class Spacecraft:
         sc_pos_km = np.asarray(self.curr_state_eme[:3], dtype=float).reshape(3)
 
         earth_pos_km = np.zeros(3, dtype=float)
-        if moon_position_eme_km is None:
-            moon_pos_km = query_moon_positions_geo_eme_km(float(jdtdb))
-        else:
-            moon_pos_km = np.asarray(
-                moon_position_eme_km,
-                dtype=float,
-            ).reshape(3)
-            if not np.all(np.isfinite(moon_pos_km)):
-                raise ValueError(
-                    "moon_position_eme_km must contain finite values."
-                )
+        moon_pos_km = np.asarray(
+            moon_position_eme_km,
+            dtype=float,
+        ).reshape(3)
+        if not np.all(np.isfinite(moon_pos_km)):
+            raise ValueError(
+                "moon_position_eme_km must contain finite values."
+            )
 
         earth_radius_km = float(configs["EARTH_RADIUS_KM"])
         moon_radius_km = float(configs["MOON_RADIUS_KM"])
@@ -407,7 +402,8 @@ class Spacecraft:
             spacecraft_boresight_eme,
             jdtdb_list,
             configs,
-            moon_positions_eme_km=None,
+            *,
+            moon_positions_eme_km,
     ):
         """Evaluate cumulative detection masks in geocentric EME/J2000.
 
@@ -426,10 +422,9 @@ class Spacecraft:
         spacecraft-to-Moon LOS directions. If ``configs["ems"]["enabled"]``
         is false, the third mask equals the second mask.
 
-        ``moon_positions_eme_km`` may supply the common Moon history selected
-        by the formation realization.  When omitted, the legacy direct-SPICE
-        Moon query is retained as a fallback for callers outside the overall
-        initial-detection simulation.
+        ``moon_positions_eme_km`` is required.  It must contain the common
+        physical Moon history queried at the same ``jdtdb_list`` epochs. This
+        method does not interpolate Moon states or select an ephemeris source.
         """
 
         def fov_deg2_to_half_angle_rad(fov_deg2):
@@ -514,19 +509,16 @@ class Spacecraft:
         b_hat = boresight / boresight_norm[:, None]
 
         earth_pos = np.zeros((n_epochs, 3), dtype=float)
-        if moon_positions_eme_km is None:
-            moon_pos = query_moon_positions_geo_eme_km(jdtdb)
-        else:
-            moon_pos = np.asarray(moon_positions_eme_km, dtype=float)
-            if moon_pos.shape != (n_epochs, 3):
-                raise ValueError(
-                    "moon_positions_eme_km must have shape "
-                    f"({n_epochs},3), got {moon_pos.shape}."
-                )
-            if not np.all(np.isfinite(moon_pos)):
-                raise ValueError(
-                    "moon_positions_eme_km must contain only finite values."
-                )
+        moon_pos = np.asarray(moon_positions_eme_km, dtype=float)
+        if moon_pos.shape != (n_epochs, 3):
+            raise ValueError(
+                "moon_positions_eme_km must have shape "
+                f"({n_epochs},3), got {moon_pos.shape}."
+            )
+        if not np.all(np.isfinite(moon_pos)):
+            raise ValueError(
+                "moon_positions_eme_km must contain only finite values."
+            )
 
         earth_radius_km = float(configs["EARTH_RADIUS_KM"])
         moon_radius_km = float(configs["MOON_RADIUS_KM"])

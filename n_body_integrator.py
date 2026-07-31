@@ -1,12 +1,7 @@
 import spiceypy as spice
 from scipy.integrate import solve_ivp
-import yaml
-import argparse
 import numpy as np
 
-# Load SPICE kernels (Ensure you downloaded DE440 as mentioned before)
-spice.furnsh("de430.bsp")
-spice.furnsh('naif0012.tls')
 
 
 class NBodyPropagator:
@@ -34,7 +29,7 @@ class NBodyPropagator:
         self,
         *,
         spice,                   # spiceypy module (kernels already furnished)
-        config: dict,            # masses + G + KM_TO_M
+        config: dict,            # normalized GMs + unit constants
         bodies=('10', '1', '2', '399', '4', '5', '6', '7', '8', '301'),
         frame="J2000",
         origin="399",              # Earth-centered
@@ -53,29 +48,21 @@ class NBodyPropagator:
         self.atol = float(atol)
         self.method = str(method)
 
-        self.KM_TO_M = float(config.get("KM_TO_M", 1000.0))
-        self.G = float(config["GRAVITATIONAL_CONSTANT"])  # m^3 kg^-1 s^-2
+        self.KM_TO_M = float(config["KM_TO_M"])
 
-        self.mass_map = {
-            "10": float(config["SUN_MASS"]),
-            "1": float(config["MERCURY_MASS"]),
-            "2": float(config["VENUS_MASS"]),
-            "399": float(config["EARTH_MASS"]),
-            "4": float(config["MARS_MASS"]),
-            "5": float(config["JUPITER_MASS"]),
-            "6": float(config["SATURN_MASS"]),
-            "7": float(config["URANUS_MASS"]),
-            "8": float(config["NEPTUNE_MASS"]),
-            "301": float(config["MOON_MASS"]),
-        }
-
-        # Ensure bodies are strings that match the dict keys
+        # Ensure bodies are strings that match the configured NAIF mapping.
         self.bodies = [str(b) for b in self.bodies]
-
-        self.masses = np.array([self.mass_map[b] for b in self.bodies], dtype=float)
-
-        # μ = G*M (m^3/s^2), keyed by body id (string)
-        self.mu_by_id = {b: self.G * self.mass_map[b] for b in self.mass_map}
+        configured_mu_km3_s2 = config["BODY_MU_BY_NAIF_KM3_S2"]
+        self.mu_by_id = {
+            str(body_id): float(mu_km3_s2) * self.KM_TO_M**3
+            for body_id, mu_km3_s2 in configured_mu_km3_s2.items()
+        }
+        unknown = [body for body in self.bodies if body not in self.mu_by_id]
+        if unknown:
+            raise KeyError(
+                "No configured gravitational parameter for NAIF IDs "
+                f"{unknown}."
+            )
 
     # ----------------------------
     # Time conversion (JDTDB -> ET)
@@ -250,40 +237,81 @@ class NBodyPropagator:
 
 
 
-def integrate_n_body(object_state, epoch, end_time, time_interval, type):
-    # Argument parser to get the config file path
-    parser = argparse.ArgumentParser(description="Run the spacecraft simulation")
-    parser.add_argument('--config', type=str, required=True, help="Path to the config file")
-    args = parser.parse_args()
+def integrate_n_body(
+    object_state,
+    epoch,
+    end_time,
+    time_interval,
+    type,
+    *,
+    config,
+):
+    """Legacy heliocentric mutual N-body integration used by IOD generation.
 
-    # Load the config file
-    with open(args.config, 'r') as file:
-        config = yaml.safe_load(file)
+    The already-normalized mission configuration is supplied explicitly.
+    This avoids reparsing command-line arguments and reloading a potentially
+    different YAML file on every integration call.
+    """
+    if config is None:
+        raise ValueError("integrate_n_body requires the normalized config.")
 
-    bodies = [10, 1, 2, 399, 4, 5, 6, 7, 8,
-              301]  # ["SUN", "MERCURY", "VENUS", "EARTH", "MARS", "JUPITER", "SATURN", "URANUS", "NEPTUNE", "MOON"]
+    legacy_cfg = config.get("legacy_n_body", {}) or {}
+    bodies = [int(value) for value in legacy_cfg["bodies"]]
+    frame = str(legacy_cfg["frame"])
+    reference_body = int(legacy_cfg["reference_body"])
+    earth_body = int(legacy_cfg["earth_body"])
 
-    masses = {
-        10: config['SUN_MASS'], 1: config['MERCURY_MASS'], 2: config['VENUS_MASS'],
-        399: config['EARTH_MASS'], 4: config['MARS_MASS'], 5: config['JUPITER_MASS'], 6: config['SATURN_MASS'],
-        7: config['URANUS_MASS'], 8: config['NEPTUNE_MASS'], 301: config['MOON_MASS'],
-        "ASTEROID": config['asteroid_mass'], "SPACECRAFT": config['mass']  # Arbitrary mass
+    mass_key_by_id = {
+        10: "SUN_MASS",
+        1: "MERCURY_MASS",
+        2: "VENUS_MASS",
+        399: "EARTH_MASS",
+        4: "MARS_MASS",
+        5: "JUPITER_MASS",
+        6: "SATURN_MASS",
+        7: "URANUS_MASS",
+        8: "NEPTUNE_MASS",
+        301: "MOON_MASS",
     }
+    unknown = [body for body in bodies if body not in mass_key_by_id]
+    if unknown:
+        raise KeyError(
+            "legacy_n_body.bodies contains unsupported NAIF IDs "
+            f"{unknown}."
+        )
+    masses = {
+        body: float(config[mass_key_by_id[body]]) for body in bodies
+    }
+    masses.update({
+        "ASTEROID": float(config['asteroid_mass']),
+        "SPACECRAFT": float(config['mass']),
+    })
 
 
     if type == "ASTEROID":
         epoch_et = spice.unitim(epoch, 'JDTDB', 'ET')  # initial epoch
-        mass_array = np.array([masses[body] for body in bodies] + [masses["ASTEROID"]])
+        mass_array = np.asarray([masses[body] for body in bodies] + [masses["ASTEROID"]], dtype=float)
     elif type == "SPACECRAFT-ASTEROIDTIME":
         epoch_et = spice.unitim(epoch, 'JDTDB', 'ET')  # initial epoch
-        mass_array = np.array([masses[body] for body in bodies] + [masses["SPACECRAFT"]])
+        mass_array = np.asarray([masses[body] for body in bodies] + [masses["SPACECRAFT"]], dtype=float)
     else:
         epoch_et = spice.str2et(epoch)
-        mass_array = np.array([masses[body] for body in bodies] + [masses["SPACECRAFT"]])
+        mass_array = np.asarray([masses[body] for body in bodies] + [masses["SPACECRAFT"]], dtype=float)
+
+    if not np.all(np.isfinite(mass_array)) or np.any(mass_array < 0.0):
+        raise ValueError(
+            "Legacy N-body masses must be finite and non-negative; "
+            f"received dtype={mass_array.dtype}, values={mass_array!r}."
+        )
 
     # Function to get state vectors (position, velocity) in km & km/s
-    def get_state(body, reference=10):
-        state, _ = spice.spkgeo(body, epoch_et, "ECLIPJ2000", reference)
+    def get_state(body):
+        state, _ = spice.spkgeo(
+            body,
+            epoch_et,
+            frame,
+            reference_body,
+        )
         return np.array(state)
 
     # Get Sun & planets' initial states
@@ -302,7 +330,7 @@ def integrate_n_body(object_state, epoch, end_time, time_interval, type):
     y0 = np.hstack([initial_positions.flatten(), initial_velocities.flatten()])
 
     # Define masses (in kg) for Sun, planets, and Moon
-    G = config['GRAVITATIONAL_CONSTANT']  # m^3 kg^-1 s^-2
+    G = float(config['GRAVITATIONAL_CONSTANT'])  # m^3 kg^-1 s^-2
 
     start_time = 0
     t_span = (start_time, end_time)  # Start at t=0, end at t=900s
@@ -328,13 +356,27 @@ def integrate_n_body(object_state, epoch, end_time, time_interval, type):
                         min_pair = (i, j)
                     accelerations[i] += G * mass_array[j] * r_vec / r_mag ** 3
 
-        if min_r < 1e6:  # 1000 km, adjust threshold
+        debug_cfg = config.get("legacy_n_body", {}) or {}
+        close_approach_km = debug_cfg.get("debug_close_approach_km")
+        if (
+            close_approach_km is not None
+            and min_r < float(close_approach_km) * config["KM_TO_M"]
+        ):
             print("t=", t, "min_r(m)=", min_r, "pair=", min_pair)
 
         return np.hstack([velocities.flatten(), accelerations.flatten()])
 
     # Solve the N-body problem
-    sol = solve_ivp(nbody_derivatives, t_span, y0, method="DOP853", t_eval=t_eval)
+    legacy_cfg = config.get("legacy_n_body", {}) or {}
+    sol = solve_ivp(
+        nbody_derivatives,
+        t_span,
+        y0,
+        method=str(legacy_cfg.get("method", "DOP853")),
+        t_eval=t_eval,
+        rtol=float(legacy_cfg.get("rtol", 1.0e-10)),
+        atol=float(legacy_cfg.get("atol", 1.0e-12)),
+    )
 
     # Extract asteroid's trajectory
     n_bodies = len(mass_array)
@@ -344,7 +386,7 @@ def integrate_n_body(object_state, epoch, end_time, time_interval, type):
     pos0 = 0
     vel0 = 3 * n
 
-    earth_i = bodies.index(399)  # should be 3
+    earth_i = bodies.index(earth_body)
     earth_positions = sol.y[pos0 + 3 * earth_i: pos0 + 3 * (earth_i + 1), :]
     earth_velocities = sol.y[vel0 + 3 * earth_i: vel0 + 3 * (earth_i + 1), :]
     object_positions = sol.y[3 * object_idx: 3 * (object_idx + 1), :]

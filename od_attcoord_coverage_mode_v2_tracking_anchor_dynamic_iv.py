@@ -161,7 +161,7 @@ def _dynamic_iv_virtual_spheres(
 
     D = float(virtual_distance)
     if not np.isfinite(D) or D <= 0.0:
-        raise ValueError("ems.dynamic_virtual_distance must be positive and finite.")
+        raise ValueError("ems.dynamic_virtual_distance_km must be positive and finite.")
     centers = p_agents_ts + D * axes
     radii = np.full((N, M), D * np.sin(half_angle_rad), dtype=float)
     return centers, radii, axes, half_angle_rad
@@ -2742,15 +2742,20 @@ class AttitudeCoordinator:
         self.display=bool(opt.get("display", False))
         self.num_candidates=int(opt.get("num_candidates", 8))
 
-        # Dynamic Earth--Moon IV-zone defaults. Legacy p_em/R_em remain as a
-        # compatibility fallback only when no Moon/IV-axis history is supplied.
+        # Dynamic Earth--Moon IV-zone defaults. The full-FOV edge clearance
+        # is shared with initial boresight packing through one config value.
+        # Legacy p_em/R_em are no longer read from configuration.
         ems = cfg.get("ems", {})
         self.ems_enabled = bool(ems.get("enabled", False))
         self.iv_half_angle_deg = float(ems.get("half_angle_deg", 0.0))
-        self.dynamic_virtual_distance = float(ems.get("dynamic_virtual_distance", 1.0e6))
-        self.p_em_default = np.array(ems.get("p_em", [0.0, 0.0, 0.0]), dtype=float)
-        self.R_em_default = float(ems.get("R_em", 0.0))
-        self.alpha_s_default = np.deg2rad(float(ems.get("alpha_s_deg", 0.0)))
+        self.dynamic_virtual_distance = float(
+            ems.get("dynamic_virtual_distance_km", 1.0e6)
+        )
+        self.p_em_default = None
+        self.R_em_default = 0.0
+        self.alpha_s_default = np.deg2rad(
+            float(ems.get("fov_clearance_margin_deg", 0.0))
+        )
         self.lambda_em_default = float(ems.get("lambda_em", 0.0))
         self.beta_zeta_default = float(ems.get("beta_zeta", 50.0))
 

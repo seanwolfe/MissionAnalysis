@@ -11,9 +11,21 @@ import time
 import os
 import random
 
-# Load SPICE kernels (Ensure you downloaded DE440 as mentioned before)
-spice.furnsh("de430.bsp")
-spice.furnsh('naif0012.tls')
+
+def _system_length_time_scales(configuration):
+    """Return the AU length scale [km] and Sun-Earth-Moon time scale [s]."""
+    length_km = (
+        float(configuration["AU_TO_M"])
+        / float(configuration["KM_TO_M"])
+    )
+    total_mu_km3_s2 = float(
+        configuration["SUN_EARTH_MOON_MU_KM3_S2"]
+    )
+    if total_mu_km3_s2 <= 0.0:
+        raise ValueError("SUN_EARTH_MOON_MU_KM3_S2 must be positive.")
+    time_s = np.sqrt(length_km**3 / total_mu_km3_s2)
+    return length_km, time_s
+
 
 
 def _set_reproducibility_seed(config):
@@ -335,10 +347,7 @@ def epoch_normalization(epoch, z_range, configuration):
     """
 
     # === Constants and scales ===
-    L =  configuration['AU_TO_M'] / configuration['KM_TO_M']# Length scale in km
-    G_km = (configuration['GRAVITATIONAL_CONSTANT'] / configuration['KM_TO_M'] ** 3)
-    sys_mass = configuration['SUN_MASS'] + configuration['MOON_MASS'] + configuration['EARTH_MASS']
-    T = np.sqrt(L ** 3 / (G_km * sys_mass))
+    L, T = _system_length_time_scales(configuration)
 
     epoch = Time(epoch)
     t_seconds = (epoch - epoch[0]).sec
@@ -397,21 +406,31 @@ def run(data, config, parameters):
     # Convert JD_TDB -> ET (seconds past J2000)
     epoch_et = spice.unitim(jd_tdb, 'JDTDB', 'ET')
 
-    def get_state(body, reference=10):
-        state, _ = spice.spkgeo(body, epoch_et, "ECLIPJ2000", reference)
+    legacy_dynamics = config["legacy_n_body"]
+
+    def get_state(body):
+        state, _ = spice.spkgeo(
+            body,
+            epoch_et,
+            legacy_dynamics["frame"],
+            int(legacy_dynamics["reference_body"]),
+        )
         return np.array(state)
 
-    earth_state = get_state(399)
+    earth_state = get_state(int(legacy_dynamics["earth_body"]))
 
     asteroid_state_geo = np.concatenate([ini_pos, ini_vel])
     asteroid_state_helio = util.geo_eme_to_geo_eclip_generic(asteroid_state_geo) + earth_state
 
     # integrate s/c traj
-    asteroid_integrated_states, asteroid_earth_states = nbody.integrate_n_body(asteroid_state_helio,
-                                                                               jd_tdb,
-                                                                               total_observation_window,
-                                                                               timestep_sec,
-                                                                               type="ASTEROID")  # integrator takes seconds
+    asteroid_integrated_states, asteroid_earth_states = nbody.integrate_n_body(
+        asteroid_state_helio,
+        jd_tdb,
+        total_observation_window,
+        timestep_sec,
+        type="ASTEROID",
+        config=config,
+    )  # integrator takes seconds
 
     asteroid_int_geo = (asteroid_integrated_states - asteroid_earth_states)
     asteroid_eme = util.geo_eclip_to_geo_eme_generic(asteroid_int_geo, layout="time")
@@ -422,10 +441,10 @@ def run(data, config, parameters):
 def solve(epochs_nd_norm_reshaped_tensor, y_obs, obs_indices, observer_positions, colloc_epochs, c, configuration, parameters, observer_velocity):
     viz_flag = bool(configuration.get('visualization_flag', 0))
 
-    L = configuration['AU_TO_M'] / configuration['KM_TO_M']  # Length scale in km
-    G_km = (configuration['GRAVITATIONAL_CONSTANT'] / configuration['KM_TO_M'] ** 3)
-    sys_mass = configuration['SUN_MASS'] + configuration['MOON_MASS'] + configuration['EARTH_MASS']
-    T = np.sqrt(L ** 3 / (G_km * sys_mass))
+    L, T = _system_length_time_scales(configuration)
+    system_mu_km3_s2 = float(
+        configuration["SUN_EARTH_MOON_MU_KM3_S2"]
+    )
     lambda_phys = parameters['PHYSICS_WEIGHT']
     lambda_dist = parameters['LAMBDA_DIST']
     q = 3
@@ -630,10 +649,7 @@ def solve(epochs_nd_norm_reshaped_tensor, y_obs, obs_indices, observer_positions
             alpha_dot, delta_dot = fit_angular_rates(self.obs_epochs, alpha, delta)
 
             # observer positions & velocities (N,3)
-            L = configuration['AU_TO_M'] / configuration['KM_TO_M']  # Length scale in km
-            G_km = (configuration['GRAVITATIONAL_CONSTANT'] / configuration['KM_TO_M'] ** 3)
-            sys_mass = configuration['SUN_MASS'] + configuration['MOON_MASS'] + configuration['EARTH_MASS']
-            T = np.sqrt(L ** 3 / (G_km * sys_mass))
+            L, T = _system_length_time_scales(configuration)
             observer_pos = self.observer_positions / L
             observer_vel = self.observer_velocities / L * T
 
@@ -746,10 +762,7 @@ def solve(epochs_nd_norm_reshaped_tensor, y_obs, obs_indices, observer_positions
             alpha_dot, delta_dot = fit_angular_rates(self.obs_epochs, alpha, delta)
 
             # observer pos & vel: (N,3)
-            L = configuration['AU_TO_M'] / configuration['KM_TO_M']  # Length scale in km
-            G_km = (configuration['GRAVITATIONAL_CONSTANT'] / configuration['KM_TO_M'] ** 3)
-            sys_mass = configuration['SUN_MASS'] + configuration['MOON_MASS'] + configuration['EARTH_MASS']
-            T = np.sqrt(L ** 3 / (G_km * sys_mass))
+            L, T = _system_length_time_scales(configuration)
             observer_pos = self.observer_positions / L
             observer_vel = self.observer_velocities * T / L
 
@@ -849,54 +862,51 @@ def solve(epochs_nd_norm_reshaped_tensor, y_obs, obs_indices, observer_positions
         return H.T, H_prime.T, H_double_prime.T  # shapes: (d, H)
     H_matrix, H_dot, H_ddot = compute_hidden_activations(epochs_nd_norm_reshaped_tensor)
 
-    def precompute_body_states(epochs, config, L, sys_mass):
-        """
-        Precompute other-body positions and nondimensional masses.
+    def precompute_body_states(epochs, config, L, system_mu_km3_s2):
+        """Precompute configured body positions and nondimensional GMs."""
+        dynamics_cfg = config["n_body_propagator"]
+        bodies = [int(body) for body in dynamics_cfg["bodies"]]
+        frame = str(dynamics_cfg["frame"])
+        origin = int(dynamics_cfg["origin"])
+        mu_by_id = config["BODY_MU_BY_NAIF_KM3_S2"]
 
-        Parameters
-        ----------
-        epochs : list[astropy.time.Time]
-            Epochs to query (N,).
-        config : dict
-            Dict containing physical constants and body masses.
-        L : float
-            Length scale for nondimensionalization.
-        sys_mass : float
-            Total system mass.
-
-        Returns
-        -------
-        positions_nd : torch.Tensor
-            (N, n, 3) nondimensional positions.
-        mus_nd : torch.Tensor
-            (n,) nondimensional body gravitational parameters.
-        """
-        bodies = [10, 1, 2, 399, 4, 5, 6, 7, 8, 301]
-        names = ['SUN', 'MERCURY', 'VENUS', 'EARTH', 'MARS',
-                 'JUPITER', 'SATURN', 'URANUS', 'NEPTUNE', 'MOON']
-        masses = np.array([config[f'{name}_MASS'] for name in names])
+        missing = [body for body in bodies if body not in mu_by_id]
+        if missing:
+            raise KeyError(
+                "No configured gravitational parameter for PIELM bodies "
+                f"{missing}."
+            )
 
         N, n = len(epochs), len(bodies)
         positions = np.zeros((N, n, 3))
-
-        # Convert epochs to ET
-        epoch_ets = [spice.unitim(t.tdb.jd, 'JDTDB', 'ET') for t in epochs]
+        epoch_ets = [
+            spice.unitim(t.tdb.jd, 'JDTDB', 'ET') for t in epochs
+        ]
 
         for i, et in enumerate(epoch_ets):
             for j, body in enumerate(bodies):
-                state, _ = spice.spkgeo(targ=body, et=et, ref='J2000', obs=399)
-                positions[i, j, :] = state[:3]  # km
+                state, _ = spice.spkgeo(
+                    targ=body,
+                    et=et,
+                    ref=frame,
+                    obs=origin,
+                )
+                positions[i, j, :] = state[:3]
 
-        # Nondimensionalize positions
         positions_nd = torch.tensor(positions / L, dtype=torch.float32)
-
-        # Nondimensionalize μ
-        G_km = (config['GRAVITATIONAL_CONSTANT'] / config['KM_TO_M'] ** 3)
-        mus = G_km * masses
-        mus_nd = torch.tensor(mus / (G_km * sys_mass), dtype=torch.float32)
-
+        mus = np.asarray([mu_by_id[body] for body in bodies], dtype=float)
+        mus_nd = torch.tensor(
+            mus / float(system_mu_km3_s2),
+            dtype=torch.float32,
+        )
         return positions_nd, mus_nd
-    non_dim_positions, non_dim_grav_params = precompute_body_states(colloc_epochs, configuration, L, sys_mass)
+
+    non_dim_positions, non_dim_grav_params = precompute_body_states(
+        colloc_epochs,
+        configuration,
+        L,
+        system_mu_km3_s2,
+    )
 
 
     # === Residual Function for Least Squares ===
@@ -986,10 +996,6 @@ def solve(epochs_nd_norm_reshaped_tensor, y_obs, obs_indices, observer_positions
                 (N, n, 3) — nondimensional positions of other bodies (geocentric).
             mus_nd : torch.Tensor
                 (n,) — nondimensional gravitational parameters of other bodies.
-            L : float
-                Length scale (e.g. Earth–Sun distance in km).
-            sys_mass : float
-                Total system mass (for nondimensionalization).
             """
 
             N, n, _ = positions_nd.shape

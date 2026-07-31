@@ -208,9 +208,9 @@ def line_of_sight_inside_invisibility_zone(
 def query_moon_positions_geo_eme_km(jd_tdb: ArrayLike) -> FloatArray:
     """Query geocentric J2000 Moon positions at Julian Date TDB epochs.
 
-    The caller must furnish an SPK containing the Earth and Moon and a leap-
-    seconds kernel before calling this function. ``Spacecraft.py`` already
-    furnishes ``de430.bsp`` and ``naif0012.tls`` once at import.
+    The caller must furnish an SPK containing the Earth and Moon and a
+    leap-seconds kernel before calling this function. The overall simulation
+    furnishes the configured kernel list once at startup.
     """
 
     import spiceypy as sp
@@ -236,20 +236,3 @@ def query_moon_positions_geo_eme_km(jd_tdb: ArrayLike) -> FloatArray:
     if was_scalar:
         return np.asarray(moon_positions[0], dtype=float)
     return moon_positions
-
-
-def compute_earth_moon_invisibility_zone(
-    jd_tdb: float,
-    spacecraft_position_geo_eme_km: ArrayLike,
-    half_angle_deg: float,
-) -> EarthMoonInvisibilityZoneBatch:
-    """Single-epoch convenience wrapper using a direct SPICE Moon query."""
-
-    spacecraft = np.asarray(spacecraft_position_geo_eme_km, dtype=float)
-    moon = query_moon_positions_geo_eme_km(float(jd_tdb))
-    return compute_earth_moon_invisibility_zone_batch(
-        spacecraft_position=spacecraft,
-        earth_position=np.zeros(3, dtype=float),
-        moon_position=moon,
-        half_angle_deg=half_angle_deg,
-    )

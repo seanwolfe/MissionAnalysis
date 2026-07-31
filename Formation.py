@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import spiceypy as spice
 from Spacecraft import Spacecraft
-from earth_moon_invisibility_zone import query_moon_positions_geo_eme_km
 
 class Formation:
     def __init__(self, configs):
@@ -221,7 +220,9 @@ class Formation:
                 ])
 
             # Convert to AU
-            self.spacecraft[i].matched_trajectory = adjusted_traj / (configs['AU_TO_M'] / 1000)
+            self.spacecraft[i].matched_trajectory = adjusted_traj / (
+                configs['AU_TO_M'] / configs['KM_TO_M']
+            )
 
         return
 
@@ -243,8 +244,8 @@ class Formation:
           - Time stays datetime (original epochs)
         """
 
-        AU_km = configs["AU_TO_M"] / 1000.0
-        SEC_PER_DAY = 86400.0
+        AU_km = configs["AU_TO_M"] / configs["KM_TO_M"]
+        SEC_PER_DAY = float(configs["SECONDS_PER_DAY"])
 
         if "Time" not in self.orbit.columns:
             raise ValueError("self.orbit must contain a 'Time' column")
@@ -382,49 +383,6 @@ class Formation:
             histories.append(values)
 
         return np.stack(histories, axis=1)
-
-    def get_common_moon_positions_secr_km(
-        self,
-        configs,
-        reference_spacecraft_index=0,
-    ):
-        """Return the common matched Moon history in SECR kilometres.
-
-        The Moon history carried by the selected reference spacecraft is used
-        as the environmental phase for the complete formation realization.
-        Spacecraft positions remain individually phased, but every spacecraft
-        uses this same Moon position at a given matched array index.
-        """
-        if not self.spacecraft:
-            raise RuntimeError("Formation contains no spacecraft.")
-
-        reference_index = int(reference_spacecraft_index)
-        if not 0 <= reference_index < len(self.spacecraft):
-            raise IndexError(
-                "reference_spacecraft_index must identify an existing spacecraft."
-            )
-
-        trajectory = self.spacecraft[reference_index].matched_trajectory_full
-        if trajectory is None:
-            raise RuntimeError(
-                "match_spacecraft_trajectory_full must be called before "
-                "requesting the common Moon history."
-            )
-
-        columns = [
-            'MOON_SUN_EARTH_CO_X_(km)',
-            'MOON_SUN_EARTH_CO_Y_(km)',
-            'MOON_SUN_EARTH_CO_Z_(km)',
-        ]
-        missing = [column for column in columns if column not in trajectory.columns]
-        if missing:
-            raise KeyError(
-                "The matched reference trajectory is missing Moon SECR columns: "
-                f"{missing}."
-            )
-
-        au_km = float(configs['AU_TO_M']) / float(configs['KM_TO_M'])
-        return trajectory.loc[:, columns].to_numpy(dtype=float) * au_km
 
     def get_index_from_pos(self, position):
         possible_positions = self.orbit.loc[:, ['SUN_EARTH_CO_X_(km)', 'SUN_EARTH_CO_Y_(km)', 'SUN_EARTH_CO_Z_(km)']]
@@ -586,9 +544,9 @@ class Formation:
             n_body_prop,
             configs,
             *,
+            moon_position_eme_km,
             absolute_magnitude_h=None,
             snr_evaluator=None,
-            moon_position_eme_km=None,
     ):
         """Generate one OD tracklet after single-epoch geometry/SNR gating.
 
@@ -606,13 +564,16 @@ class Formation:
 
         The detectability test is applied at the initial tracklet epoch only;
         accepted spacecraft generate the complete configured tracklet.
+
+        ``moon_position_eme_km`` is mandatory.  The caller must query the
+        authoritative physical Moon at this same asteroid/timer JDTDB epoch
+        and pass that one common position to the complete formation.
         """
 
         def mas_to_rad(x_mas):
-            return (
+            return np.deg2rad(
                 np.asarray(x_mas, dtype=float)
-                * np.pi
-                / (180.0 * 3600.0 * 1000.0)
+                / float(configs["MAS_TO_DEGREE"])
             )
 
         def result_field(result, field_name, count):
@@ -660,18 +621,12 @@ class Formation:
             if not np.isfinite(absolute_magnitude_h):
                 raise ValueError("absolute_magnitude_h must be finite.")
 
-        # One common Moon position is used by all spacecraft for both geometry
-        # and SNR at this OD opportunity.
-        if moon_position_eme_km is None:
-            common_moon_position_km = np.asarray(
-                query_moon_positions_geo_eme_km(epoch),
-                dtype=float,
-            ).reshape(3)
-        else:
-            common_moon_position_km = np.asarray(
-                moon_position_eme_km,
-                dtype=float,
-            ).reshape(3)
+        # One explicitly supplied common Moon position is used by all
+        # spacecraft for geometry and SNR at this OD opportunity.
+        common_moon_position_km = np.asarray(
+            moon_position_eme_km,
+            dtype=float,
+        ).reshape(3)
         if not np.all(np.isfinite(common_moon_position_km)):
             raise ValueError("The common Moon position must contain finite values.")
 
@@ -916,65 +871,3 @@ class Formation:
             epochs,
             detection_results,
         )
-
-
-
-
-
-#################
-# test to see if formation is in good spots
-########################
-
-"""
-# Load YAML config file
-with open("orbit_det_configuration.yaml", "r") as file:
-    config = yaml.safe_load(file)
-
-num_tests = 10
-
-for i in range(0, num_tests):
-    formation_i = Formation(config)
-    formation_i.initial_formation(config)
-
-    kmtoau = 6.68459e-9
-    start = config['quasi_halo_start']
-    end = config['quasi_halo_end']
-
-    fig = plt.figure()
-    ax = fig.add_subplot(projection='3d')
-    ax.plot(formation_i.orbit["MOON_SUN_EARTH_CO_X_(km)"].iloc[start:end] * kmtoau,
-            formation_i.orbit["MOON_SUN_EARTH_CO_Y_(km)"].iloc[start:end] * kmtoau,
-            formation_i.orbit["MOON_SUN_EARTH_CO_Z_(km)"].iloc[start:end] * kmtoau, label='Moon')
-    ax.plot(formation_i.orbit["SUN_EARTH_CO_X_(km)"].iloc[start:end] * kmtoau,
-            formation_i.orbit["SUN_EARTH_CO_Y_(km)"].iloc[start:end] * kmtoau,
-            formation_i.orbit["SUN_EARTH_CO_Z_(km)"].iloc[start:end] * kmtoau)
-    ax.scatter(0.009, 0, 0, label='L_1', s=20)
-
-    for i, sc in enumerate(formation_i.spacecraft):
-        ax.scatter(sc.position[0] * kmtoau, sc.position[1] * kmtoau, sc.position[2] * kmtoau, s=20)
-
-    # Create a sphere (Earth model)
-    theta = np.linspace(0, np.pi, 30)  # Latitude
-    phi = np.linspace(0, 2 * np.pi, 60)  # Longitude
-    theta, phi = np.meshgrid(theta, phi)
-
-    # Earth radius (approx. in arbitrary units)
-    R = 6378  # Normalize radius
-
-    # Convert spherical to Cartesian coordinates
-    x = R * np.sin(theta) * np.cos(phi)
-    y = R * np.sin(theta) * np.sin(phi)
-    z = R * np.cos(theta)
-
-    # Plot wireframe Earth
-    ax.plot_wireframe(x * kmtoau, y * kmtoau, z * kmtoau, color="blue", linewidth=0.5, alpha=0.7)
-
-    ax.set_xlabel('X (au)')
-    ax.set_ylabel('Y (au)')
-    ax.set_zlabel('Z (au)')
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=4))  # Adjust nbins for number of ticks
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=4))  # Adjust nbins for number of ticks
-    ax.zaxis.set_major_locator(MaxNLocator(nbins=4))  # Adjust nbins for number of ticks
-    ax.legend()
-    plt.show()
-"""

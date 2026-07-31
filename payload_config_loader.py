@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
-import yaml
+
+from simulation_config import (
+    load_simulation_config,
+    normalize_simulation_config,
+)
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,10 @@ def validate_payload_mapping(payload_snr: Mapping[str, Any]) -> None:
         raise ValueError("Stage-2 production configuration requires angular_rate.mode='state_derived'.")
 
     environment = _require_mapping(payload_snr["environment"], "payload_snr.environment")
+    _require_finite_positive(
+        environment["astronomical_unit_km"],
+        "payload_snr.environment.astronomical_unit_km",
+    )
     _require_finite_positive(environment["solar_radius_km"], "payload_snr.environment.solar_radius_km")
     _require_finite_positive(environment["solar_temperature_k"], "payload_snr.environment.solar_temperature_k")
     for body_name in ("earth", "moon"):
@@ -178,9 +186,15 @@ def load_payload_configuration(
 ) -> LoadedPayloadConfiguration:
     """Load and validate ``payload_snr`` and its NPZ spectral response."""
 
-    if "payload_snr" not in config:
+    normalized = normalize_simulation_config(
+        config,
+        config_path=config_path,
+    )
+    if "payload_snr" not in normalized:
         raise KeyError("Configuration has no 'payload_snr' section.")
-    payload_snr = dict(_require_mapping(config["payload_snr"], "payload_snr"))
+    payload_snr = dict(
+        _require_mapping(normalized["payload_snr"], "payload_snr")
+    )
     validate_payload_mapping(payload_snr)
 
     spectral = _require_mapping(payload_snr["spectral_response"], "payload_snr.spectral_response")
@@ -236,10 +250,7 @@ def load_payload_configuration_from_yaml(
     """Read a YAML file and return its validated payload configuration."""
 
     path = Path(yaml_path).expanduser().resolve()
-    with path.open("r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-    if not isinstance(config, Mapping):
-        raise TypeError(f"YAML root must be a mapping: {path}")
+    config = load_simulation_config(path)
     return load_payload_configuration(config, config_path=path)
 
 

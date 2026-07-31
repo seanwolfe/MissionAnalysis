@@ -1,4 +1,3 @@
-import yaml
 import os
 import pandas as pd
 from Asteroid import Asteroid
@@ -31,10 +30,189 @@ import hashlib
 from payload_snr_adapter import PayloadSNREvaluator
 from initial_boresight_packing import compute_initial_boresight_history
 from earth_moon_invisibility_zone import query_moon_positions_geo_eme_km
+from simulation_config import load_simulation_config, load_spice_kernels
 
-# Load SPICE kernels (Ensure you downloaded DE440 as mentioned before)
-sp.furnsh("de430.bsp")
-sp.furnsh('naif0012.tls')
+
+
+def _authoritative_moon_geo_eme_km(jdtdb):
+    """Return the physical geocentric EME/J2000 Moon at simulation epoch(s).
+
+    The asteroid/timer JDTDB epoch is the common mission clock.  Every
+    initial-detection, OD-detection, SNR, physical-occultation, dynamic-IV,
+    and attitude-coordination calculation obtains its Moon state from this
+    single SPICE-backed provider.  No Moon-state interpolation and no
+    spacecraft-reference-orbit wrapping are used.
+    """
+    epochs = np.asarray(jdtdb, dtype=float)
+    moon = np.asarray(
+        query_moon_positions_geo_eme_km(jdtdb),
+        dtype=float,
+    )
+
+    if epochs.ndim == 0:
+        moon = moon.reshape(3)
+    else:
+        moon = moon.reshape(-1, 3)
+        if moon.shape[0] != epochs.size:
+            raise RuntimeError(
+                "Authoritative Moon query returned an unexpected number of "
+                f"states: requested {epochs.size}, received {moon.shape[0]}."
+            )
+
+    if not np.all(np.isfinite(moon)):
+        raise ValueError(
+            "Authoritative Moon SPICE query returned non-finite values."
+        )
+    return moon
+
+
+def _resolve_attitude_slew_limits(formation, config):
+    """Return the common payload FOV and spacecraft slew-envelope values.
+
+    The inertia calculation uses the existing spacecraft-bus and telescope
+    geometry model. ``adcs.I_max_override_kg_m2`` may replace the calculated
+    maximum inertia used for the slew limits. A missing or null override keeps
+    the calculated value.
+
+    The returned calculated/used/source fields are retained now so the later
+    diagnostics upgrade can record them without duplicating this calculation.
+    """
+    if formation is None or not getattr(formation, "spacecraft", None):
+        raise ValueError(
+            "A formation containing at least one spacecraft is required to "
+            "calculate attitude slew limits."
+        )
+
+    sc0 = formation.spacecraft[0]
+    theta_h_rad = float(util.fov_deg2_to_half_angle_rad(float(sc0.fov)))
+
+    tau_max_n_m = float(sc0.reaction_wheel_torque)
+    h_max_n_m_s = float(sc0.reaction_wheel_momentum)
+    bus_mass_kg = float(sc0.mass)
+    bus_length_m = float(sc0.length)
+    telescope_mass_kg = float(sc0.telescope_mass)
+    telescope_diameter_m = float(sc0.telescope_diameter)
+    telescope_length_m = float(sc0.telescope_length)
+    telescope_offset_m = float(sc0.telescope_offset)
+
+    scalar_inputs = {
+        "reaction_wheel_torque": tau_max_n_m,
+        "reaction_wheel_momentum": h_max_n_m_s,
+        "mass": bus_mass_kg,
+        "length": bus_length_m,
+        "telescope_mass": telescope_mass_kg,
+        "telescope_diameter": telescope_diameter_m,
+        "telescope_length": telescope_length_m,
+        "telescope_offset": telescope_offset_m,
+    }
+    bad_inputs = [
+        name for name, value in scalar_inputs.items()
+        if not np.isfinite(value)
+    ]
+    if bad_inputs:
+        raise ValueError(
+            "Non-finite spacecraft/ADCS inputs while calculating slew "
+            f"limits: {bad_inputs}."
+        )
+    if tau_max_n_m <= 0.0 or h_max_n_m_s <= 0.0:
+        raise ValueError(
+            "reaction_wheel_torque and reaction_wheel_momentum must be "
+            "positive."
+        )
+    if (
+        bus_mass_kg <= 0.0
+        or bus_length_m <= 0.0
+        or telescope_mass_kg < 0.0
+        or telescope_diameter_m < 0.0
+        or telescope_length_m < 0.0
+    ):
+        raise ValueError(
+            "Spacecraft masses and dimensions used by the inertia model must "
+            "be physically valid."
+        )
+
+    # Existing maximum-axis inertia approximation:
+    #   bus cube about its centre
+    # + telescope cylinder about its centre
+    # + telescope parallel-axis offset.
+    i_bus_kg_m2 = (1.0 / 6.0) * bus_mass_kg * bus_length_m**2
+    i_telescope_centroid_kg_m2 = (
+        (1.0 / 12.0)
+        * telescope_mass_kg
+        * (
+            3.0 * (telescope_diameter_m / 2.0) ** 2
+            + telescope_length_m**2
+        )
+    )
+    i_telescope_offset_kg_m2 = (
+        telescope_mass_kg * telescope_offset_m**2
+    )
+    i_max_calculated_kg_m2 = (
+        i_bus_kg_m2
+        + i_telescope_centroid_kg_m2
+        + i_telescope_offset_kg_m2
+    )
+    if (
+        not np.isfinite(i_max_calculated_kg_m2)
+        or i_max_calculated_kg_m2 <= 0.0
+    ):
+        raise ValueError(
+            "Calculated I_max must be finite and positive, got "
+            f"{i_max_calculated_kg_m2!r} kg m^2."
+        )
+
+    adcs_cfg = config.get("adcs", {}) or {}
+    if not isinstance(adcs_cfg, dict):
+        raise TypeError("adcs must be a YAML mapping.")
+
+    override_value = adcs_cfg.get("I_max_override_kg_m2", None)
+    if override_value is None:
+        i_max_override_kg_m2 = None
+        i_max_used_kg_m2 = i_max_calculated_kg_m2
+        i_max_source = "calculated"
+    else:
+        i_max_override_kg_m2 = float(override_value)
+        if (
+            not np.isfinite(i_max_override_kg_m2)
+            or i_max_override_kg_m2 <= 0.0
+        ):
+            raise ValueError(
+                "adcs.I_max_override_kg_m2 must be null or a finite positive "
+                f"value, got {override_value!r}."
+            )
+        i_max_used_kg_m2 = i_max_override_kg_m2
+        i_max_source = "override"
+
+    slew_authority_factor = float(adcs_cfg["slew_authority_factor"])
+    if (
+        not np.isfinite(slew_authority_factor)
+        or slew_authority_factor <= 0.0
+    ):
+        raise ValueError(
+            "adcs.slew_authority_factor must be finite and positive."
+        )
+
+    alpha_max_rad_s2 = (
+        slew_authority_factor * tau_max_n_m / i_max_used_kg_m2
+    )
+    omega_max_rad_s = (
+        slew_authority_factor * h_max_n_m_s / i_max_used_kg_m2
+    )
+
+    return {
+        "theta_h_rad": theta_h_rad,
+        "I_max_calculated_kg_m2": float(i_max_calculated_kg_m2),
+        "I_max_override_kg_m2": (
+            None
+            if i_max_override_kg_m2 is None
+            else float(i_max_override_kg_m2)
+        ),
+        "I_max_used_kg_m2": float(i_max_used_kg_m2),
+        "I_max_source": i_max_source,
+        "slew_authority_factor": float(slew_authority_factor),
+        "alpha_max_rad_s2": float(alpha_max_rad_s2),
+        "omega_max_rad_s": float(omega_max_rad_s),
+    }
 
 
 def run_runs_x_minimoons_MPI(minimoon_master, config):
@@ -183,23 +361,18 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
             for char in text
         )
 
-    def _body_positions_geo_eme_km(candidate_jdtdb):
-        """Return Sun, Earth, and Moon positions in geocentric J2000 km."""
+    def _sun_and_earth_positions_geo_eme_km(candidate_jdtdb):
+        """Return Sun and geocentric Earth positions in J2000 kilometres."""
         epochs = np.asarray(candidate_jdtdb, dtype=float).reshape(-1)
         sun_position_km = np.empty((len(epochs), 3), dtype=float)
-        moon_position_km = np.empty((len(epochs), 3), dtype=float)
         for epoch_index, jdtdb in enumerate(epochs):
             et = sp.unitim(float(jdtdb), "JDTDB", "ET")
             sun_state, _ = sp.spkgeo(10, et, "J2000", 399)
-            moon_state, _ = sp.spkgeo(301, et, "J2000", 399)
             sun_position_km[epoch_index, :] = np.asarray(
                 sun_state[:3], dtype=float
             )
-            moon_position_km[epoch_index, :] = np.asarray(
-                moon_state[:3], dtype=float
-            )
         earth_position_km = np.zeros_like(sun_position_km)
-        return sun_position_km, earth_position_km, moon_position_km
+        return sun_position_km, earth_position_km
 
     # ------------- main loop over my tasks -----
     for t in task_indices:
@@ -225,29 +398,24 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
             config
         )
         formation = Formation(config)
-        # old
-        # asteroid_pos = current_minimoon.orbit.loc[:, ['Synodic x', 'Synodic y', 'Synodic z']].values
-        # earth_pos = np.zeros_like(asteroid_pos)
-        # moon_pos = current_minimoon.orbit.loc[:, ['Moon Synodic x', 'Moon Synodic y', 'Moon Synodic z']].values
-        # 
-        # formation.match_spacecraft_trajectory(len(asteroid_pos[:, 0]), config)
-        # 
-        
-        # new
         ast_traj_au_eclip = np.array(current_minimoon.orbit.loc[:, ["Geo x", "Geo y", "Geo z",
                                                                     "Geo vx", "Geo vy", "Geo vz"]])
         ast_traj_au_eclip[:, :3] *= (config["AU_TO_M"] / config["KM_TO_M"])
         ast_traj_au_eclip[:, 3:] *= (config["AU_TO_M"] / config["KM_TO_M"] / config["SECONDS_PER_DAY"])
         ast_traj = util.geo_eclip_to_geo_eme_generic(ast_traj_au_eclip)
-        jdtdb_epochs = current_minimoon.orbit["Julian Date"]
+        jdtdb_epochs = np.asarray(
+            current_minimoon.orbit["Julian Date"], dtype=float
+        ).reshape(-1)
         formation.match_spacecraft_trajectory_full(len(ast_traj[:, 0]), config)
 
         # -------------------------------------------------------------
         # Compute the complete initial-search boresight ephemeris exactly
         # once for this formation realization.  The already-matched and
         # already-phased spacecraft trajectories define the formation
-        # geometry.  SC1's matched Moon history is the common environmental
-        # Moon history for planning, detection, and SNR.
+        # geometry.  The physical Moon is queried from SPICE at the asteroid
+        # JDTDB epochs, which are the common initial-search mission clock.
+        # The same Moon states are reused for planning, occultation, dynamic
+        # IV exclusion, and SNR.
         # -------------------------------------------------------------
         earth_helio_ae = np.array(
             current_minimoon.orbit.loc[
@@ -275,9 +443,20 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
         spacecraft_positions_secr_km = (
             formation.get_matched_spacecraft_positions_secr_km(config)
         )
-        common_moon_secr_km = formation.get_common_moon_positions_secr_km(
-            config,
-            reference_spacecraft_index=0,
+
+        # One physical Moon state per asteroid/common simulation epoch.
+        # Convert the same EME history to SECR only because the initial
+        # boresight-packing algorithm operates in the rotating SECR frame.
+        common_moon_eme_km = _authoritative_moon_geo_eme_km(jdtdb_epochs)
+        common_moon_eclip_km = util.geo_eme_to_geo_eclip_generic(
+            common_moon_eme_km,
+            hint=("time", "position"),
+        )
+        common_moon_secr_km = util.geo_eclip_to_geo_secr_generic(
+            common_moon_eclip_km,
+            earth_helio_ae,
+            obj_hint=("time", "position"),
+            earth_hint=("time", "state"),
         )
 
         boresight_solution = compute_initial_boresight_history(
@@ -315,18 +494,6 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
                     hint=("time", "position"),
                 )
             )
-
-        # Transform the same common Moon history for detection and SNR.
-        common_moon_eclip_km = util.geo_secr_to_geo_eclip_generic(
-            common_moon_secr_km,
-            earth_helio_ae,
-            obj_hint=("time", "position"),
-            earth_hint=("time", "state"),
-        )
-        common_moon_eme_km = util.geo_eclip_to_geo_eme_generic(
-            common_moon_eclip_km,
-            hint=("time", "position"),
-        )
 
         # Persist the SECR ephemeris once so the IOD stage can store the exact
         # formation boresights at INDEX_USED without rerunning the planner.
@@ -367,17 +534,8 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
 
         new_rows = []
         for jdx, spacecraft in enumerate(formation.spacecraft):
-        
-            # old
-            # sc_pos = spacecraft.matched_trajectory
-            # 
-            # NEW: function now returns (base_result, ems_filtered_result)
-            # visible_base, visible_ems = spacecraft.asteroid_in_fov_batch(
-            #     asteroid_pos, sc_pos, earth_pos, moon_pos, config
-            # )
-        
-            # new
-            # get s/c eme traj at ast epoch
+
+            # Get the spacecraft EME trajectory at the asteroid epochs.
             sc_traj = util.sc_eme_ast_eme(
                 sc_df=spacecraft.matched_trajectory_full,
                 earth_ast_kms_array=earth_helio_ae,
@@ -455,8 +613,7 @@ def run_runs_x_minimoons_MPI(minimoon_master, config):
                 (
                     sun_position_km,
                     earth_position_km,
-                    _moon_position_spice_km,
-                ) = _body_positions_geo_eme_km(candidate_epochs)
+                ) = _sun_and_earth_positions_geo_eme_km(candidate_epochs)
                 moon_position_km = common_moon_eme_km[candidate_idx]
 
                 geometry_kwargs = {
@@ -1194,12 +1351,14 @@ def run_sim_runnumbers_MPI_getIOD(config):
                 num_frames = int(config["number_of_frames"])
                 step_days = config["time_between_frames"] / config["SECONDS_PER_DAY"]
                 epochs = asteroid_epoch + step_days * np.arange(num_frames)
-                total_window_s = num_frames * config["time_between_frames"]
+                total_window_s = float(config["tracklet_collection_time_sec"])
 
                 # ---- integrate asteroid (needed for IOD) ----
                 asteroid_integrated_states, asteroid_earth_states = nbody.integrate_n_body(
                     asteroid_state_helio, asteroid_epoch, total_window_s,
-                    config["time_between_frames"], type="ASTEROID"
+                    config["time_between_frames"],
+                    type="ASTEROID",
+                    config=config,
                 )
 
                 asteroid_state_secr = util.helio_eclip_to_geo_secr_generic(
@@ -1219,7 +1378,9 @@ def run_sim_runnumbers_MPI_getIOD(config):
 
                 sc_int_states, earth_states = nbody.integrate_n_body(
                     sc_helio_ini, sc_epoch_str, total_window_s,
-                    config["time_between_frames"], type="SPACECRAFT"
+                    config["time_between_frames"],
+                    type="SPACECRAFT",
+                    config=config,
                 )
 
                 sc_secr = util.helio_eclip_to_geo_secr_generic(sc_int_states, earth_states, layout="time")
@@ -1252,7 +1413,9 @@ def run_sim_runnumbers_MPI_getIOD(config):
 
                 sc_helio_states, asteroid_earth_states_2 = nbody.integrate_n_body(
                     sc_helio_ini_state, asteroid_epoch, total_window_s,
-                    config["time_between_frames"], type="SPACECRAFT-ASTEROIDTIME"
+                    config["time_between_frames"],
+                    type="SPACECRAFT-ASTEROIDTIME",
+                    config=config,
                 )
 
                 sc_eme_states = util.helio_eclip_to_geo_eme_generic(
@@ -1540,6 +1703,25 @@ def run_IOD(config):
     # Load MASTER once for reading (workers)
     df_master = pd.read_csv(master_fn)
 
+    def _row_has_valid_iod_result(row):
+        """Return True only when the committed IOD state is usable by OD."""
+        if "IOD_FINAL_STATE" not in row.index:
+            return False
+        value = row.get("IOD_FINAL_STATE", None)
+        if value is None or pd.isna(value) or not str(value).strip():
+            return False
+        try:
+            state = np.asarray(util.parse_vec_cell(value), dtype=float).reshape(-1)
+        except Exception:
+            return False
+        if state.size != 6 or not np.all(np.isfinite(state)):
+            return False
+
+        result_name = row.get("IOD_RESULT_SAVED_AS", "")
+        if pd.isna(result_name) or not str(result_name).strip():
+            return False
+        return True
+
     # -----------------------------
     # Column order spec (final write order)
     # -----------------------------
@@ -1580,7 +1762,6 @@ def run_IOD(config):
         "HIDDEN_DIMENSION",
         "PHYSICS_WEIGHT",
         "LAMBDA_DIST",
-        "LAMBDA_DIST",  # (keep if you actually use it twice; otherwise remove)
         "WEIGHT_SCALE_FACTOR",
         "NUMBER_OF_ITERATIONS",
         "TEMPERATURE",
@@ -1622,10 +1803,29 @@ def run_IOD(config):
         if not master_uid:
             master_uid = fallback_uid_from_row(row, m_idx)
 
-        # resume-skip (per row)
+        # Resume only when both the marker and the committed MASTER result
+        # exist. A regenerated MASTER may coexist with stale stage-3 markers.
         if is_done(master_uid):
-            skipped += 1
-            continue
+            if _row_has_valid_iod_result(row):
+                skipped += 1
+                continue
+
+            stale_marker = done_marker_path(master_uid)
+            try:
+                os.remove(stale_marker)
+            except FileNotFoundError:
+                pass
+            except OSError as marker_error:
+                print(
+                    f"[rank {rank}] Could not remove stale IOD marker "
+                    f"{stale_marker}: {marker_error}",
+                    flush=True,
+                )
+            print(
+                f"[rank {rank}] Stale IOD marker ignored for row {m_idx} "
+                f"({master_uid}); MASTER has no valid IOD_FINAL_STATE.",
+                flush=True,
+            )
 
         try:
             # ------------------- YOUR IOD PIPELINE (single run) -------------------
@@ -1791,9 +1991,16 @@ def run_IOD(config):
             )
             gc.collect()
 
-        except Exception:
-            # Do not mark .done here; committing happens only after master write
+        except Exception as exc:
+            # Do not mark .done here; committing happens only after master write.
+            # Report the row failure so Stage 4 cannot appear to fail mysteriously.
             errors += 1
+            print(
+                f"[rank {rank}] IOD solve failed for MASTER row {m_idx} "
+                f"({master_uid}): {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            traceback.print_exc()
             continue
 
     # ===== Gather updates to rank 0, write MASTER in-place with order, then commit markers =====
@@ -2518,6 +2725,9 @@ def run_OD(config_global):
         and boresight-command-crosslink delays through SimTime.
       - Ordinary no-detection classification occurs only after collection,
         preprocessing, and detection processing have elapsed.
+      - EMS blackout classification uses only the pure dynamic-IV occlusion flag.
+      - Reacquisition attempts are counted only after a completed AC/command/slew,
+        and the configured limit persists across repeated blackout intervals.
     """
 
     # --- MPI setup ---
@@ -2923,6 +3133,14 @@ def run_OD(config_global):
             "OD_DETECTING_IDS": _csv_scalar(last.get("detecting_ids", "")),
             "OD_NO_DETECTION_REASON": _csv_scalar(last.get("no_detection_reason", "")),
             "OD_ALL_EMS_OCCLUDED": _csv_scalar(last.get("all_ems_occluded", np.nan)),
+            "OD_ANY_EMS_OCCLUDED": _csv_scalar(last.get("any_ems_occluded", np.nan)),
+            "OD_N_EMS_OCCLUDED": _csv_scalar(last.get("n_ems_occluded", np.nan)),
+            "OD_N_IV_CLEAR": _csv_scalar(last.get("n_iv_clear", np.nan)),
+            "OD_N_IN_FOV": _csv_scalar(last.get("n_in_fov", np.nan)),
+            "OD_N_PHYSICAL_CLEAR": _csv_scalar(last.get("n_physical_clear", np.nan)),
+            "OD_N_SNR_EVALUATED": _csv_scalar(last.get("n_snr_evaluated", np.nan)),
+            "OD_N_SNR_PASS": _csv_scalar(last.get("n_snr_pass", np.nan)),
+            "OD_N_ACTIVE_DETECTED": _csv_scalar(last.get("n_active_detected", np.nan)),
             "OD_IN_EMS_BLACKOUT": _csv_scalar(last.get("in_ems_blackout", np.nan)),
             "OD_PENDING_REACQUISITION": _csv_scalar(last.get("pending_reacquisition", np.nan)),
             "OD_REACQUISITION_ATTEMPT_COUNT": _csv_scalar(last.get("reacquisition_attempt_count", np.nan)),
@@ -3215,34 +3433,64 @@ def run_OD(config_global):
                 pass
         return vals
 
-    def _ems_detection_flags(detection_res_k):
-        """Return EMS/no-detection flags from Formation.detect() result dictionaries.
+    def _ems_detection_flags(detection_res_k, *, expected_num_spacecraft=None, ems_enabled=True):
+        """Summarize active detection and pure dynamic-IV failure modes.
 
-        occluded_ems is the pure EMS exclusion flag. It is intentionally used
-        instead of visible_ems_filtered, because visible_ems_filtered also folds
-        in FOV and Earth/Moon visibility.
+        ``occluded_ems`` is the only field used to classify an EMS/IV blackout.
+        It is intentionally kept separate from ``detected`` and
+        ``visible_ems_filtered``, which may also include FOV, physical
+        occultation, and SNR gating.
         """
         try:
-            rows = list(detection_res_k or [])
+            raw_rows = list(detection_res_k or [])
         except Exception:
-            rows = []
+            raw_rows = []
 
-        if len(rows) == 0:
-            return {
-                "any_detected": False,
-                "all_ems_occluded": False,
-                "any_ems_occluded": False,
-                "n_ems_occluded": 0,
-            }
+        rows = [row for row in raw_rows if isinstance(row, dict)]
+        expected = (
+            int(expected_num_spacecraft)
+            if expected_num_spacecraft is not None
+            else len(raw_rows)
+        )
 
-        any_detected = any(bool(d.get("detected", False)) for d in rows if isinstance(d, dict))
-        ems_flags = [bool(d.get("occluded_ems", False)) for d in rows if isinstance(d, dict)]
+        active_flags = [bool(row.get("detected", False)) for row in rows]
+        ems_flags = [bool(row.get("occluded_ems", False)) for row in rows]
+        in_fov_flags = [bool(row.get("in_fov", False)) for row in rows]
+        physical_clear_flags = [
+            not bool(
+                row.get("occluded_earth", False)
+                or row.get("occluded_moon", False)
+                or row.get("occluded_em", False)
+            )
+            for row in rows
+        ]
+        snr_evaluated_flags = [bool(row.get("snr_evaluated", False)) for row in rows]
+        snr_pass_flags = [bool(row.get("snr_pass", False)) for row in rows]
+
+        n_rows = len(rows)
         n_ems = int(sum(ems_flags))
+        complete_result_set = bool(expected > 0 and n_rows == expected)
+        all_ems = bool(
+            ems_enabled
+            and complete_result_set
+            and n_rows > 0
+            and all(ems_flags)
+        )
+
         return {
-            "any_detected": bool(any_detected),
-            "all_ems_occluded": bool(len(ems_flags) == len(rows) and len(rows) > 0 and all(ems_flags)),
+            "any_detected": bool(any(active_flags)),
+            "n_active_detected": int(sum(active_flags)),
+            "all_ems_occluded": all_ems,
             "any_ems_occluded": bool(any(ems_flags)),
             "n_ems_occluded": n_ems,
+            "n_iv_clear": int(max(n_rows - n_ems, 0)),
+            "n_in_fov": int(sum(in_fov_flags)),
+            "n_physical_clear": int(sum(physical_clear_flags)),
+            "n_snr_evaluated": int(sum(snr_evaluated_flags)),
+            "n_snr_pass": int(sum(snr_pass_flags)),
+            "n_result_rows": int(n_rows),
+            "expected_num_spacecraft": int(expected),
+            "complete_result_set": complete_result_set,
         }
 
     def _no_detection_state_dict(in_ems_blackout, pending_reacquisition, reacquisition_attempt_count):
@@ -3610,6 +3858,11 @@ def run_OD(config_global):
 
     # Load MASTER (workers)
     df_master = pd.read_csv(master_fn)
+    if "IOD_FINAL_STATE" not in df_master.columns:
+        raise RuntimeError(
+            "MASTER_IOD.csv has no IOD_FINAL_STATE column. Run the IOD solve "
+            "stage and remove/ignore stale iod_stage3_done markers before OD."
+        )
 
     # ---------------------------------------------------------
     # Startup load balancing for resumed OD jobs
@@ -3723,8 +3976,26 @@ def run_OD(config_global):
     max_reacquisition_attempts_after_blackout = int(
         od_no_det_cfg.get("max_reacquisition_attempts_after_blackout", 1)
     )
-    terminate_if_ems_visible_but_not_detected = bool(
-        od_no_det_cfg.get("terminate_if_ems_visible_but_not_detected", True)
+    terminate_on_non_ems_no_detection = bool(
+        od_no_det_cfg.get(
+            "terminate_on_non_ems_no_detection",
+            od_no_det_cfg.get("terminate_if_ems_visible_but_not_detected", True),
+        )
+    )
+    if ems_blackout_dt_sec <= 0.0:
+        raise ValueError("od_no_detection.ems_blackout_dt_sec must be positive.")
+    if max_reacquisition_attempts_after_blackout < 0:
+        raise ValueError(
+            "od_no_detection.max_reacquisition_attempts_after_blackout "
+            "must be non-negative."
+        )
+
+    ems_cfg_global = config_global.get("ems", {}) or {}
+    od_ems_enabled = bool(
+        ems_cfg_global.get(
+            "enabled",
+            config_global.get("INCLUDE_EMS_EXCLUSION", False),
+        )
     )
 
     # Tracking-anchor behavior for attitude coordination.  This is separate
@@ -3779,6 +4050,14 @@ def run_OD(config_global):
         "detecting_ids",
         "no_detection_reason",
         "all_ems_occluded",
+        "any_ems_occluded",
+        "n_ems_occluded",
+        "n_iv_clear",
+        "n_in_fov",
+        "n_physical_clear",
+        "n_snr_evaluated",
+        "n_snr_pass",
+        "n_active_detected",
         "in_ems_blackout",
         "pending_reacquisition",
         "reacquisition_attempt_count",
@@ -3897,6 +4176,14 @@ def run_OD(config_global):
         "OD_DETECTING_IDS",
         "OD_NO_DETECTION_REASON",
         "OD_ALL_EMS_OCCLUDED",
+        "OD_ANY_EMS_OCCLUDED",
+        "OD_N_EMS_OCCLUDED",
+        "OD_N_IV_CLEAR",
+        "OD_N_IN_FOV",
+        "OD_N_PHYSICAL_CLEAR",
+        "OD_N_SNR_EVALUATED",
+        "OD_N_SNR_PASS",
+        "OD_N_ACTIVE_DETECTED",
         "OD_IN_EMS_BLACKOUT",
         "OD_PENDING_REACQUISITION",
         "OD_REACQUISITION_ATTEMPT_COUNT",
@@ -4005,7 +4292,6 @@ def run_OD(config_global):
             ra_noise = config['sigma_ra']
             dec_noise = config['sigma_dec']
             pointing_noise = config['sigma_pointing']
-            meas_noise = config['sigma_meas_noise']
 
             # ukf weight values
             alpha = config['alpha_ukf']
@@ -4017,7 +4303,18 @@ def run_OD(config_global):
             # ---------------------------------------------
             # build objects
             # -------------------------------------------
-            n_body_propagator = nbody.NBodyPropagator(spice=sp, config=config)
+            propagator_cfg = config["n_body_propagator"]
+            n_body_propagator = nbody.NBodyPropagator(
+                spice=sp,
+                config=config,
+                bodies=tuple(propagator_cfg["bodies"]),
+                frame=propagator_cfg["frame"],
+                origin=propagator_cfg["origin"],
+                eps=propagator_cfg["eps"],
+                rtol=propagator_cfg["rtol"],
+                atol=propagator_cfg["atol"],
+                method=propagator_cfg["method"],
+            )
 
             ukf = OD_UKF(
                 x0=setup["x0_eme_kms"],
@@ -4371,6 +4668,14 @@ def run_OD(config_global):
                 detecting_ids_str = ""
                 no_detection_reason = ""
                 all_ems_occluded = False
+                any_ems_occluded = False
+                n_ems_occluded = 0
+                n_iv_clear = num_sc
+                n_in_fov = 0
+                n_physical_clear = 0
+                n_snr_evaluated = 0
+                n_snr_pass = 0
+                n_active_detected = 0
                 od_time = np.nan
                 attcoord_time = np.nan
                 chosen_candidate_idx = np.nan
@@ -4413,7 +4718,7 @@ def run_OD(config_global):
                     # One common Moon position per candidate epoch is shared by
                     # the formation. The coordinator then computes a separate
                     # dynamic IV axis for each spacecraft from its own position.
-                    attcoord_moon_positions_eme_km = query_moon_positions_geo_eme_km(
+                    attcoord_moon_positions_eme_km = _authoritative_moon_geo_eme_km(
                         timer.attcoord_searchtimes_jdtdb
                     )
                     attcoord_earth_positions_eme_km = np.zeros_like(
@@ -4422,8 +4727,8 @@ def run_OD(config_global):
 
                     ast_truth_original_eclip = np.array(minimoon.orbit.loc[:, ["Geo x", "Geo y", "Geo z", "Geo vx",
                                                                                "Geo vy", "Geo vz"]])
-                    ast_truth_original_eclip[:, :3] *= config['AU_TO_M'] / 1000
-                    ast_truth_original_eclip[:, 3:] *= config['AU_TO_M'] / 1000 / config['SECONDS_PER_DAY']
+                    ast_truth_original_eclip[:, :3] *= config['AU_TO_M'] / config['KM_TO_M']
+                    ast_truth_original_eclip[:, 3:] *= config['AU_TO_M'] / config['KM_TO_M'] / config['SECONDS_PER_DAY']
                     ast_truth_original_eme = util.geo_eclip_to_geo_eme_generic(ast_truth_original_eclip,
                                                                                hint=("time", "state"))
 
@@ -4435,7 +4740,7 @@ def run_OD(config_global):
                             P_ts,
                             sc_trajs_km2=sc_eme_states_kms_piecewise,
                             stride=config['two_d_prop']['stride'],
-                            n_std=config['two_d_prop']['stride'],
+                            n_std=config['two_d_prop']['n_std'],
                             planes=("xy", "xz", "yz"),
                             title_prefix="Asteroid prior + spacecraft"
                         )
@@ -4452,19 +4757,13 @@ def run_OD(config_global):
 
                     sc_pointings_eme = formation.get_spacecraft_pointings()
 
-                    sc0 = formation.spacecraft[0]
-                    theta_h_rad = util.fov_deg2_to_half_angle_rad(sc0.fov)
-                    tau_max = sc0.reaction_wheel_torque
-                    h_max = sc0.reaction_wheel_momentum
-                    m_m = sc0.mass
-                    l_m = sc0.length
-                    m_t = sc0.telescope_mass
-                    d_t = sc0.telescope_diameter
-                    l_t = sc0.telescope_length
-                    z_0 = sc0.telescope_offset
-                    I_max = (1 / 6) * m_m * (l_m) ** 2 + (1 /12) * m_t * (3*(d_t / 2) ** 2 + l_t ** 2) + m_t * z_0 ** 2
-                    alpha_max = 1.63 * tau_max / I_max
-                    omega_max = 1.63 * h_max / I_max
+                    slew_limits = _resolve_attitude_slew_limits(
+                        formation,
+                        config,
+                    )
+                    theta_h_rad = slew_limits["theta_h_rad"]
+                    alpha_max = slew_limits["alpha_max_rad_s2"]
+                    omega_max = slew_limits["omega_max_rad_s"]
 
                     # Initial attitude coordination preserves the initial detector
                     # as a tracking anchor and fixes it to the predicted mean LOS
@@ -4523,12 +4822,6 @@ def run_OD(config_global):
                     minimoon.set_state(np.squeeze(ast_eme_traj_kms[best_idx, :]))
 
                     timer.step(best_epoch_jdtdb, k_anchor_best, t_anchor_best)
-
-                    # If this no-detection step was a reacquisition planning attempt
-                    # after EMS blackout, count it only after attitude coordination
-                    # has successfully produced and applied a new pointing.
-                    if (not had_detection) and pending_reacquisition:
-                        reacquisition_attempt_count += 1
 
                     chosen_candidate_idx = best_idx
                     chosen_candidate_epoch_jdtdb = best_epoch_jdtdb
@@ -4999,6 +5292,9 @@ def run_OD(config_global):
                     #######################################################
                     # Gather Tracklet data and Detect
                     ######################################################
+                    detection_moon_position_eme_km = (
+                        _authoritative_moon_geo_eme_km(timer.curr_epoch)
+                    )
                     p_meas_k, n_meas_k, sc_states_k, ast_states_k, epochs_k, detection_res_k = formation.detect(
                         minimoon.curr_state_eme,
                         timer.curr_epoch,
@@ -5006,6 +5302,7 @@ def run_OD(config_global):
                         config,
                         absolute_magnitude_h=absolute_magnitude_h,
                         snr_evaluator=od_snr_evaluator,
+                        moon_position_eme_km=detection_moon_position_eme_km,
                     )
 
                     # optional visualization block unchanged
@@ -5091,55 +5388,80 @@ def run_OD(config_global):
                     tracking_anchor_mode = "none"
                     tracking_anchor_feasible = int(False)
 
-                    ems_flags = _ems_detection_flags(detection_res_k)
+                    ems_flags = _ems_detection_flags(
+                        detection_res_k,
+                        expected_num_spacecraft=num_sc,
+                        ems_enabled=od_ems_enabled,
+                    )
                     all_ems_occluded = bool(ems_flags["all_ems_occluded"])
+                    any_ems_occluded = bool(ems_flags["any_ems_occluded"])
+                    n_ems_occluded = int(ems_flags["n_ems_occluded"])
+                    n_iv_clear = int(ems_flags["n_iv_clear"])
+                    n_in_fov = int(ems_flags["n_in_fov"])
+                    n_physical_clear = int(ems_flags["n_physical_clear"])
+                    n_snr_evaluated = int(ems_flags["n_snr_evaluated"])
+                    n_snr_pass = int(ems_flags["n_snr_pass"])
+                    n_active_detected = int(ems_flags["n_active_detected"])
                     no_detection_reason = ""
                     terminate_for_object_lost = False
                     ems_blackout_prediction_only = False
 
                     if had_detection and int(n_detections) > 0:
+                        # A successful active detection ends the entire blackout/
+                        # reacquisition episode and is the only event that resets the
+                        # completed-attempt counter.
                         no_detection_reason = ""
                         all_ems_occluded = False
                         in_ems_blackout = False
                         pending_reacquisition = False
                         reacquisition_attempt_count = 0
                     else:
-                        # EMS blackout dominates: if every spacecraft LOS is EMS-occluded,
-                        # do not spend compute on attitude coordination. Just advance by the
-                        # configured blackout cadence with prediction only.
                         if all_ems_occluded:
+                            # Complete dynamic-IV blockage is classified only from the
+                            # pure per-spacecraft occluded_ems flag. Preserve any attempts
+                            # already spent in the same loss episode; a later blackout must
+                            # not grant a fresh reacquisition budget.
                             no_detection_reason = "ems_blackout_all"
                             event_type = "ems_blackout_prediction_only"
                             in_ems_blackout = True
-                            pending_reacquisition = False
-                            reacquisition_attempt_count = 0
+                            pending_reacquisition = True
                             ems_blackout_prediction_only = True
-                        elif in_ems_blackout:
-                            # EMS just became clear after a blackout. The current no-detection
-                            # happened with pre-reacquisition pointings, so allow attitude
-                            # coordination once before declaring the object lost.
-                            no_detection_reason = "ems_visible_after_blackout_reacquisition"
-                            event_type = "ems_reacquisition_attcoord"
+                        elif pending_reacquisition or in_ems_blackout:
+                            # The formation is IV-clear after an EMS blackout, or is
+                            # evaluating the result of a previous reacquisition slew.
+                            just_cleared_blackout = bool(in_ems_blackout)
                             in_ems_blackout = False
                             pending_reacquisition = True
-                        elif pending_reacquisition:
-                            # A reacquisition attempt has already been performed. If the next
-                            # EMS-visible detection check still finds nothing, terminate unless
-                            # the config allows more reacquisition attempts.
+
                             if (
-                                terminate_if_ems_visible_but_not_detected
-                                and reacquisition_attempt_count >= max_reacquisition_attempts_after_blackout
+                                reacquisition_attempt_count
+                                >= max_reacquisition_attempts_after_blackout
                             ):
-                                no_detection_reason = "object_lost_after_ems_reacquisition"
+                                no_detection_reason = (
+                                    "object_lost_after_ems_blackout_no_reacquisition_attempts"
+                                    if max_reacquisition_attempts_after_blackout == 0
+                                    else "object_lost_after_ems_reacquisition"
+                                )
                                 event_type = "termination_object_lost_after_ems_reacquisition"
                                 terminate_for_object_lost = True
                             else:
-                                no_detection_reason = "ems_reacquisition_retry_no_detection"
+                                no_detection_reason = (
+                                    "ems_visible_after_blackout_reacquisition"
+                                    if just_cleared_blackout
+                                    and reacquisition_attempt_count == 0
+                                    else "ems_reacquisition_retry_no_detection"
+                                )
                                 event_type = "ems_reacquisition_attcoord"
                         else:
-                            no_detection_reason = "object_lost_no_detection"
-                            event_type = "termination_object_lost_no_detection"
-                            terminate_for_object_lost = bool(terminate_if_ems_visible_but_not_detected)
+                            # IV is not sufficient to explain the formation-wide miss.
+                            # This includes FOV, physical-occultation, and low-SNR losses.
+                            if terminate_on_non_ems_no_detection:
+                                no_detection_reason = "object_lost_non_ems_no_detection"
+                                event_type = "termination_object_lost_non_ems_no_detection"
+                                terminate_for_object_lost = True
+                            else:
+                                no_detection_reason = "non_ems_no_detection_attcoord"
+                                event_type = "non_ems_no_detection_attcoord"
 
                     ast_eme_state_kms_during_detection = minimoon.curr_state_eme
 
@@ -5444,6 +5766,14 @@ def run_OD(config_global):
                             "detecting_ids": detecting_ids_str,
                             "no_detection_reason": no_detection_reason,
                             "all_ems_occluded": int(bool(all_ems_occluded)),
+                            "any_ems_occluded": int(bool(any_ems_occluded)),
+                            "n_ems_occluded": int(n_ems_occluded),
+                            "n_iv_clear": int(n_iv_clear),
+                            "n_in_fov": int(n_in_fov),
+                            "n_physical_clear": int(n_physical_clear),
+                            "n_snr_evaluated": int(n_snr_evaluated),
+                            "n_snr_pass": int(n_snr_pass),
+                            "n_active_detected": int(n_active_detected),
                             "in_ems_blackout": int(bool(in_ems_blackout)),
                             "pending_reacquisition": int(bool(pending_reacquisition)),
                             "reacquisition_attempt_count": int(reacquisition_attempt_count),
@@ -5512,7 +5842,7 @@ def run_OD(config_global):
                         chosen_candidate_epoch_jdtdb = np.nan
 
                         t_after_tracklet = float(processed_epoch_last) if np.isfinite(processed_epoch_last) else float(timer.curr_epoch)
-                        target_epoch = float(timer.curr_epoch) + float(ems_blackout_dt_sec) / 86400.0
+                        target_epoch = float(timer.curr_epoch) + float(ems_blackout_dt_sec) / float(config["SECONDS_PER_DAY"])
                         target_epoch = max(target_epoch, t_after_tracklet)
                         target_epoch = min(target_epoch, float(timer.end_time))
 
@@ -5586,6 +5916,14 @@ def run_OD(config_global):
                             "detecting_ids": detecting_ids_str,
                             "no_detection_reason": no_detection_reason,
                             "all_ems_occluded": int(bool(all_ems_occluded)),
+                            "any_ems_occluded": int(bool(any_ems_occluded)),
+                            "n_ems_occluded": int(n_ems_occluded),
+                            "n_iv_clear": int(n_iv_clear),
+                            "n_in_fov": int(n_in_fov),
+                            "n_physical_clear": int(n_physical_clear),
+                            "n_snr_evaluated": int(n_snr_evaluated),
+                            "n_snr_pass": int(n_snr_pass),
+                            "n_active_detected": int(n_active_detected),
                             "in_ems_blackout": int(bool(in_ems_blackout)),
                             "pending_reacquisition": int(bool(pending_reacquisition)),
                             "reacquisition_attempt_count": int(reacquisition_attempt_count),
@@ -5792,7 +6130,7 @@ def run_OD(config_global):
                     ast_eme_traj_kms = n_body_propagator.propagate(ast_eme_state_kms, timer.curr_epoch,
                                                                    timer.attcoord_searchtimes_jdtdb)
 
-                    attcoord_moon_positions_eme_km = query_moon_positions_geo_eme_km(
+                    attcoord_moon_positions_eme_km = _authoritative_moon_geo_eme_km(
                         timer.attcoord_searchtimes_jdtdb
                     )
                     attcoord_earth_positions_eme_km = np.zeros_like(
@@ -5801,8 +6139,8 @@ def run_OD(config_global):
 
                     ast_truth_original_eclip = np.array(minimoon.orbit.loc[:, ["Geo x", "Geo y", "Geo z", "Geo vx",
                                                                                "Geo vy", "Geo vz"]])
-                    ast_truth_original_eclip[:, :3] *= config['AU_TO_M'] / 1000
-                    ast_truth_original_eclip[:, 3:] *= config['AU_TO_M'] / 1000 / config['SECONDS_PER_DAY']
+                    ast_truth_original_eclip[:, :3] *= config['AU_TO_M'] / config['KM_TO_M']
+                    ast_truth_original_eclip[:, 3:] *= config['AU_TO_M'] / config['KM_TO_M'] / config['SECONDS_PER_DAY']
                     ast_truth_original_eme = util.geo_eclip_to_geo_eme_generic(ast_truth_original_eclip,
                                                                                hint=("time", "state"))
 
@@ -5813,7 +6151,7 @@ def run_OD(config_global):
                             P_ts,
                             sc_trajs_km2=sc_eme_states_kms_piecewise,
                             stride=config['two_d_prop']['stride'],
-                            n_std=config['two_d_prop']['stride'],
+                            n_std=config['two_d_prop']['n_std'],
                             planes=("xy", "xz", "yz"),
                             title_prefix="Asteroid prior + spacecraft"
                         )
@@ -5831,20 +6169,13 @@ def run_OD(config_global):
 
                     sc_pointings_eme = formation.get_spacecraft_pointings()
 
-                    sc0 = formation.spacecraft[0]
-                    theta_h_rad = util.fov_deg2_to_half_angle_rad(sc0.fov)
-                    tau_max = sc0.reaction_wheel_torque
-                    h_max = sc0.reaction_wheel_momentum
-                    m_m = sc0.mass
-                    l_m = sc0.length
-                    m_t = sc0.telescope_mass
-                    d_t = sc0.telescope_diameter
-                    l_t = sc0.telescope_length
-                    z_0 = sc0.telescope_offset
-                    I_max = (1 / 6) * m_m * (l_m) ** 2 + (1 / 12) * m_t * (
-                                3 * (d_t / 2) ** 2 + l_t ** 2) + m_t * z_0 ** 2
-                    alpha_max = 1.63 * tau_max / I_max
-                    omega_max = 1.63 * h_max / I_max
+                    slew_limits = _resolve_attitude_slew_limits(
+                        formation,
+                        config,
+                    )
+                    theta_h_rad = slew_limits["theta_h_rad"]
+                    alpha_max = slew_limits["alpha_max_rad_s2"]
+                    omega_max = slew_limits["omega_max_rad_s"]
 
                     use_tracking = bool(config_global.get('use_tracking', False))
                     detecting_list = list(formation.currently_detecting)
@@ -5965,6 +6296,13 @@ def run_OD(config_global):
                     minimoon.set_state(np.squeeze(ast_eme_traj_kms[best_idx, :]))
 
                     timer.step(best_epoch_jdtdb, k_anchor_best, t_anchor_best)
+
+                    # Count a reacquisition attempt only after attitude coordination
+                    # successfully produced a command, the command was applied, and the
+                    # simulation reached the selected post-slew epoch. A failed optimizer
+                    # call or an EMS prediction-only step therefore consumes no attempt.
+                    if pending_reacquisition and not measurements_available_for_cycle:
+                        reacquisition_attempt_count += 1
 
                     chosen_candidate_idx = best_idx
                     chosen_candidate_epoch_jdtdb = best_epoch_jdtdb
@@ -6597,6 +6935,14 @@ def run_OD(config_global):
                     "detecting_ids": detecting_ids_str,
                     "no_detection_reason": no_detection_reason,
                     "all_ems_occluded": int(bool(all_ems_occluded)),
+                    "any_ems_occluded": int(bool(any_ems_occluded)),
+                    "n_ems_occluded": int(n_ems_occluded),
+                    "n_iv_clear": int(n_iv_clear),
+                    "n_in_fov": int(n_in_fov),
+                    "n_physical_clear": int(n_physical_clear),
+                    "n_snr_evaluated": int(n_snr_evaluated),
+                    "n_snr_pass": int(n_snr_pass),
+                    "n_active_detected": int(n_active_detected),
                     "in_ems_blackout": int(bool(in_ems_blackout)),
                     "pending_reacquisition": int(bool(pending_reacquisition)),
                     "reacquisition_attempt_count": int(reacquisition_attempt_count),
@@ -7021,17 +7367,51 @@ def run_overall_OD(master, config):
                     # ensure marker dir exists
                     os.makedirs(stage3_done_dir, exist_ok=True)
 
-                    # count how many rows have a done marker
+                    def row_has_valid_iod_result(row):
+                        if "IOD_FINAL_STATE" not in row.index:
+                            return False
+                        value = row.get("IOD_FINAL_STATE", None)
+                        if value is None or pd.isna(value) or not str(value).strip():
+                            return False
+                        try:
+                            state = np.asarray(
+                                util.parse_vec_cell(value), dtype=float
+                            ).reshape(-1)
+                        except Exception:
+                            return False
+                        if state.size != 6 or not np.all(np.isfinite(state)):
+                            return False
+                        result_name = row.get("IOD_RESULT_SAVED_AS", "")
+                        return (
+                            not pd.isna(result_name)
+                            and bool(str(result_name).strip())
+                        )
+
+                    # Count a row complete only when both the marker and the
+                    # committed result in MASTER are valid.
                     done_count = 0
-                    for i, saved_as in enumerate(dfm.get("IOD_DATA_SAVED_AS", pd.Series([None] * n_rows))):
+                    stale_count = 0
+                    for i, row in dfm.iterrows():
+                        saved_as = row.get("IOD_DATA_SAVED_AS", None)
                         uid = uid_for_row(i, saved_as)
                         marker = os.path.join(stage3_done_dir, f"{uid}.done")
-                        if os.path.exists(marker):
+                        if os.path.exists(marker) and row_has_valid_iod_result(row):
                             done_count += 1
+                        elif os.path.exists(marker):
+                            stale_count += 1
 
                     do_stage3 = (done_count < n_rows)
-                    msg3 = (f"[Stage: IOD Solve] {'RUN' if do_stage3 else 'SKIP'} — "
-                            f"{done_count}/{n_rows} rows committed in {stage3_done_dir}")
+                    msg3 = (
+                        f"[Stage: IOD Solve] "
+                        f"{'RUN' if do_stage3 else 'SKIP'} — "
+                        f"{done_count}/{n_rows} rows have both a marker and a "
+                        f"valid IOD_FINAL_STATE"
+                        + (
+                            f"; {stale_count} stale marker(s) will be ignored"
+                            if stale_count
+                            else ""
+                        )
+                    )
             except Exception as e:
                 do_stage3 = False
                 msg3 = f"[Stage: IOD Solve] Failed to inspect MASTER_IOD.csv: {e}"
@@ -7045,6 +7425,67 @@ def run_overall_OD(master, config):
         run_IOD(config)
     else:
         comm.Barrier()
+
+    # Verify that every MASTER row needed by OD has a committed six-element
+    # IOD state. This prevents a later KeyError or opaque parsing failure.
+    if rank == 0:
+        master_path = os.path.join(top_dir, "MASTER_IOD.csv")
+        iod_ready = True
+        iod_readiness_message = ""
+        try:
+            df_check = pd.read_csv(master_path)
+            if "IOD_FINAL_STATE" not in df_check.columns:
+                iod_ready = False
+                iod_readiness_message = (
+                    "MASTER_IOD.csv has no IOD_FINAL_STATE column. "
+                    "The IOD solve was skipped, used stale markers, or every "
+                    "IOD row failed."
+                )
+            else:
+                bad_rows = []
+                for row_index, row in df_check.iterrows():
+                    value = row.get("IOD_FINAL_STATE", None)
+                    try:
+                        state = np.asarray(
+                            util.parse_vec_cell(value), dtype=float
+                        ).reshape(-1)
+                        valid = (
+                            state.size == 6
+                            and np.all(np.isfinite(state))
+                            and bool(
+                                str(row.get("IOD_RESULT_SAVED_AS", "")).strip()
+                            )
+                        )
+                    except Exception:
+                        valid = False
+                    if not valid:
+                        bad_rows.append(int(row_index))
+
+                if bad_rows:
+                    iod_ready = False
+                    preview = bad_rows[:20]
+                    suffix = "..." if len(bad_rows) > len(preview) else ""
+                    iod_readiness_message = (
+                        f"{len(bad_rows)} MASTER row(s) have no valid committed "
+                        f"IOD result: {preview}{suffix}. Review the printed "
+                        "per-row IOD traceback(s)."
+                    )
+        except Exception as check_error:
+            iod_ready = False
+            iod_readiness_message = (
+                f"Could not validate MASTER_IOD.csv before OD: {check_error}"
+            )
+    else:
+        iod_ready = None
+        iod_readiness_message = None
+
+    iod_ready = comm.bcast(iod_ready, root=0)
+    iod_readiness_message = comm.bcast(iod_readiness_message, root=0)
+    if not iod_ready:
+        raise RuntimeError(
+            "OD will not start because IOD preparation is incomplete. "
+            + str(iod_readiness_message)
+        )
 
     # -----------------
     # Stage 4: Run the ATT.COOR. + OD Pipeline
@@ -7064,14 +7505,12 @@ parser = argparse.ArgumentParser(description="Run the spacecraft simulation")
 parser.add_argument('--config', type=str, required=True, help="Path to the config file")
 args = parser.parse_args()
 
-# Load the config file
+# Load, merge constants, derive shared values, and validate the config.
 config_path = os.path.abspath(args.config)
-with open(config_path, 'r') as file:
-    config = yaml.safe_load(file)
+config = load_simulation_config(config_path)
 
-# Preserve the YAML location so payload_snr_adapter can resolve the NPZ path.
-config["__config_path__"] = config_path
-config["__config_dir__"] = os.path.dirname(config_path)
+# Kernels are configured in YAML and furnished once per process.
+load_spice_kernels(sp, config)
 
 # get the master file
 master = util.read_csv_comma_or_space(config['minimoon_master_file_path'], header=0)

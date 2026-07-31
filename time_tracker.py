@@ -25,7 +25,7 @@ class SimTime:
         self.curr_epoch = current_epoch  # JDTDB; start of the current cycle
         self.curr_integration_epoch = current_integration_epoch
         self.curr_integration_index = current_integration_index
-        self.seconds_per_day = float(configs.get("SECONDS_PER_DAY", 86400.0))
+        self.seconds_per_day = float(configs["SECONDS_PER_DAY"])
         self.end_time = self.curr_epoch + float(configs["od_duration_days"])
 
         # Candidate slew-duration grid searched by attitude coordination.
@@ -63,10 +63,15 @@ class SimTime:
                 attitude_coordination_expected_time
             )
 
-        # Tracklet and onboard-detection delays.
-        self.datacollect_time = (
-            int(configs["number_of_frames"])
-            * float(configs["time_between_frames"])
+        # Tracklet and onboard-detection delays. Collection ends at the end
+        # of the final exposure, rather than one complete cadence after the
+        # final frame start.
+        self.frame_cadence_time = float(configs["time_between_frames"])
+        self.exposure_time = float(
+            configs["payload_snr"]["detector"]["exposure_time_s"]
+        )
+        self.datacollect_time = float(
+            configs["tracklet_collection_time_sec"]
         )
         self.detection_patchtime = float(configs["patch_time"])
         big_h, big_l = (

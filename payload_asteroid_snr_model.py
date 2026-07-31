@@ -84,16 +84,7 @@ from scipy.interpolate import CubicSpline
 
 FloatArray: TypeAlias = NDArray[np.float64]
 
-AU_KM = 149_597_870.7
 ARCSEC_PER_RADIAN = 206_264.80624709636
-
-# Visible, overridable preliminary defaults.
-DEFAULT_SUN_RADIUS_KM = 695_700.0
-DEFAULT_SUN_TEMPERATURE_K = 5_772.0
-DEFAULT_EARTH_RADIUS_KM = 6_371.0
-DEFAULT_EARTH_GEOMETRIC_ALBEDO = 0.434
-DEFAULT_MOON_RADIUS_KM = 1_737.4
-DEFAULT_MOON_GEOMETRIC_ALBEDO = 0.12
 
 
 @dataclass(frozen=True)
@@ -201,20 +192,18 @@ class BodyProperties:
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    """Solar, Earth, and Moon constants used by the model."""
+    """Solar, Earth, Moon, and distance constants used by the model.
 
-    solar_radius_km: float = DEFAULT_SUN_RADIUS_KM
-    solar_temperature_k: float = DEFAULT_SUN_TEMPERATURE_K
-    earth: BodyProperties = BodyProperties(
-        radius_km=DEFAULT_EARTH_RADIUS_KM,
-        geometric_albedo=DEFAULT_EARTH_GEOMETRIC_ALBEDO,
-        phase_law="lambert",
-    )
-    moon: BodyProperties = BodyProperties(
-        radius_km=DEFAULT_MOON_RADIUS_KM,
-        geometric_albedo=DEFAULT_MOON_GEOMETRIC_ALBEDO,
-        phase_law="lommel_seeliger",
-    )
+    Production callers must supply every field from the normalized mission
+    configuration; the pure physics module carries no independent body-radius
+    or astronomical-unit defaults.
+    """
+
+    astronomical_unit_km: float
+    solar_radius_km: float
+    solar_temperature_k: float
+    earth: BodyProperties
+    moon: BodyProperties
 
 
 @dataclass(frozen=True)
@@ -753,11 +742,11 @@ def compute_apparent_angular_speed(
 
 def prepare_payload_terms(
     payload: PayloadConfig,
-    environment: EnvironmentConfig | None = None,
+    environment: EnvironmentConfig,
 ) -> PreparedPayloadTerms:
     """Precompute payload-static spectral and photometric quantities."""
 
-    env = environment or EnvironmentConfig()
+    env = environment
     wavelength_m, qe, throughput = _prepare_spectral_inputs(payload)
     zero_point_mag = compute_photometric_zero_point(
         payload=payload,
@@ -804,8 +793,8 @@ def compute_asteroid_snr(
         Cartesian positions and velocities. Vector quantities use shape
         (..., 3). All states must share one frame and epoch per batch element.
     environment
-        Solar, Earth, and Moon constants. Visible defaults are used when
-        omitted.
+        Solar, Earth, Moon, and distance constants. Production callers must
+        supply this from the normalized mission configuration.
     options
         Model switches. Continuous effective aperture area is used by default.
     phase_model
@@ -825,7 +814,10 @@ def compute_asteroid_snr(
     decision.
     """
 
-    environment = environment or EnvironmentConfig()
+    if environment is None:
+        raise ValueError(
+            "environment must be supplied from the normalized mission config."
+        )
     options = options or SNROptions()
     phase_model = phase_model or HG12PhaseModel.from_default_table()
     stray_light = stray_light or StrayLightConfig()
@@ -885,10 +877,10 @@ def compute_asteroid_snr(
     apparent_magnitude = compute_apparent_magnitude(
         absolute_magnitude=absolute_magnitude,
         asteroid_sun_distance_au=(
-            geometry_terms.asteroid_sun_distance_km / AU_KM
+            geometry_terms.asteroid_sun_distance_km / environment.astronomical_unit_km
         ),
         asteroid_observer_distance_au=(
-            geometry_terms.asteroid_observer_distance_km / AU_KM
+            geometry_terms.asteroid_observer_distance_km / environment.astronomical_unit_km
         ),
         asteroid_phase_function=direct_phase.phase_function,
     )
@@ -1122,10 +1114,10 @@ def compute_asteroid_snr(
             geometry_terms.apparent_angular_speed_arcsec_s
         ),
         asteroid_sun_distance_au=(
-            geometry_terms.asteroid_sun_distance_km / AU_KM
+            geometry_terms.asteroid_sun_distance_km / environment.astronomical_unit_km
         ),
         asteroid_observer_distance_au=(
-            geometry_terms.asteroid_observer_distance_km / AU_KM
+            geometry_terms.asteroid_observer_distance_km / environment.astronomical_unit_km
         ),
         direct_phase_angle_rad=geometry_terms.direct_phase_angle_rad,
         earth_asteroid_phase_angle_rad=(
@@ -2023,6 +2015,8 @@ def _validate_model_inputs(
     if np.any(boresight_norm <= 0.0):
         raise ValueError("boresight_unit_vector must be nonzero.")
 
+    if environment.astronomical_unit_km <= 0.0:
+        raise ValueError("astronomical_unit_km must be positive.")
     if environment.solar_radius_km <= 0.0:
         raise ValueError("solar_radius_km must be positive.")
     if environment.solar_temperature_k <= 0.0:

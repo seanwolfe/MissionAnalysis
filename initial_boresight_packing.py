@@ -187,7 +187,6 @@ def _read_configuration(config: dict) -> dict:
 
     required = (
         "nominal_boresight_secr",
-        "iv_clearance_margin_deg",
         "fov_separation_margin_deg",
         "outward_clearance_buffer_deg",
         "packing_search_step_deg",
@@ -209,7 +208,9 @@ def _read_configuration(config: dict) -> dict:
         "nominal": nominal,
         "iv_half_angle_deg": float(ems["half_angle_deg"]),
         "fov_deg2": float(config["fov"]),
-        "iv_clearance_margin_deg": float(packing["iv_clearance_margin_deg"]),
+        "iv_clearance_margin_deg": float(
+            ems["fov_clearance_margin_deg"]
+        ),
         "fov_separation_margin_deg": float(
             packing["fov_separation_margin_deg"]
         ),
@@ -259,8 +260,9 @@ def compute_initial_boresight_history(
         used for every spacecraft at a given epoch.
     config
         Mission YAML mapping.  The payload FOV is read from top-level ``fov``;
-        the IV half-angle is read from ``ems.half_angle_deg``; packing-specific
-        margins and search limits are read from ``initial_boresight_packing``.
+        the IV half-angle and common full-FOV clearance margin are read from
+        ``ems``; packing-specific separation/search limits are read from
+        ``initial_boresight_packing``.
     """
 
     sc_positions = np.asarray(spacecraft_positions_secr_km, dtype=float)
