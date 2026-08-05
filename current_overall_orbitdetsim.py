@@ -1328,14 +1328,23 @@ def run_sim_runnumbers_MPI_getIOD(config):
                         boresights_at_index_secr[sc_number - 1].copy()
                     )
 
-                run_number_value = detected_minimoon.get("run_number", np.nan)
+                row_index = detected_minimoon.name
+
+                if isinstance(row_index, tuple) and len(row_index) >= 3:
+                    # Visible rows use:
+                    # (run_number, object_id, spacecraft_number)
+                    run_number_value = row_index[0]
+                else:
+                    # Defensive fallback for a future flat-index/column representation.
+                    run_number_value = detected_minimoon.get("run_number", np.nan)
+
                 try:
                     simulation_run_number = int(run_number_value)
                 except Exception as exc:
                     raise ValueError(
                         "Visible detection row has no valid run_number for "
                         f"object={mm_id}, spacecraft={sc_id}: "
-                        f"{run_number_value!r}."
+                        f"{run_number_value!r}; row index={row_index!r}."
                     ) from exc
 
                 file_name = (
