@@ -525,6 +525,32 @@ def normalize_simulation_config(
         raise ValueError("spice.kernels must be a non-empty YAML list.")
     spice_cfg["kernels"] = [str(kernel) for kernel in kernels]
 
+    # ------------------------------------------------------------------
+    # Optional end-of-run mission outcome summary.
+    # ------------------------------------------------------------------
+    mission_summary = cfg.get("mission_summary", {}) or {}
+    if not isinstance(mission_summary, Mapping):
+        raise TypeError("mission_summary must be a YAML mapping.")
+    mission_summary = deepcopy(dict(mission_summary))
+
+    enabled = mission_summary.get("enabled", False)
+    fail_on_error = mission_summary.get("fail_on_error", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("mission_summary.enabled must be boolean.")
+    if not isinstance(fail_on_error, bool):
+        raise TypeError("mission_summary.fail_on_error must be boolean.")
+
+    output_folder = str(
+        mission_summary.get("output_folder", "mission_summary")
+    ).strip()
+    if not output_folder:
+        raise ValueError("mission_summary.output_folder cannot be empty.")
+
+    mission_summary["enabled"] = enabled
+    mission_summary["output_folder"] = output_folder
+    mission_summary["fail_on_error"] = fail_on_error
+    cfg["mission_summary"] = mission_summary
+
     cfg["derived"] = {
         "focal_length_m": focal_length_m,
         "sigma_ra_mas": sigma_ra_mas,

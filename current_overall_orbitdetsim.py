@@ -950,6 +950,7 @@ def run_sim_runnumbers_MPI_getIOD(config):
     master_columns = (
             [
                 "ID_AST",
+                "RUN_NUMBER",
                 "TBO_H",
                 "EPOCH_AST(jdtdb)",
                 "HELIO_AST(kms)",
@@ -1327,7 +1328,20 @@ def run_sim_runnumbers_MPI_getIOD(config):
                         boresights_at_index_secr[sc_number - 1].copy()
                     )
 
-                file_name = f"minimoon-{mm_id}_sc-{int(sc_id)}_index-{idx0}_{src_base}"
+                run_number_value = detected_minimoon.get("run_number", np.nan)
+                try:
+                    simulation_run_number = int(run_number_value)
+                except Exception as exc:
+                    raise ValueError(
+                        "Visible detection row has no valid run_number for "
+                        f"object={mm_id}, spacecraft={sc_id}: "
+                        f"{run_number_value!r}."
+                    ) from exc
+
+                file_name = (
+                    f"run-{simulation_run_number}_minimoon-{mm_id}_"
+                    f"sc-{int(sc_id)}_index-{idx0}_{src_base}"
+                )
                 base_path = os.path.join(data_done_dir, file_name)
                 row_uid = file_name
 
@@ -1512,6 +1526,7 @@ def run_sim_runnumbers_MPI_getIOD(config):
 
                     row_dict = {
                         "ID_AST": mm_id,
+                        "RUN_NUMBER": simulation_run_number,
                         "TBO_H": (
                             f"{tbo_h_val:.16g}" if np.isfinite(tbo_h_val) else ""
                         ),
@@ -1732,6 +1747,7 @@ def run_IOD(config):
     detection_block = (
             [
                 "ID_AST",
+                "RUN_NUMBER",
                 "TBO_H",
                 "EPOCH_AST(jdtdb)",
                 "HELIO_AST(kms)",
@@ -2926,6 +2942,18 @@ def run_OD(config_global):
                 writer.writeheader()
             writer.writerow(row_dict)
 
+    def _append_outer_row(
+        csv_path,
+        row_dict,
+        header,
+        *,
+        simulation_run_number,
+    ):
+        """Append one outer-loop row with the simulation realization number."""
+        enriched = dict(row_dict)
+        enriched["run_number"] = int(simulation_run_number)
+        _append_row(csv_path, enriched, header)
+
     def _write_progress(progress_path, payload):
         os.makedirs(os.path.dirname(progress_path), exist_ok=True)
         with open(progress_path, "w", encoding="utf-8") as f:
@@ -3118,6 +3146,7 @@ def run_OD(config_global):
         row = {
             "master_row_idx": int(m_idx),
             "run_uid": uid,
+            "RUN_NUMBER": _csv_scalar(last.get("run_number", np.nan)),
             "rank": int(rank),
             "OD_RUN_UID": uid,
             "OD_RANK": int(rank),
@@ -4035,6 +4064,7 @@ def run_OD(config_global):
 
     outer_header = [
         "run_uid",
+        "run_number",
         "master_row_idx",
         "rank",
         "od_step_idx",
@@ -4161,6 +4191,7 @@ def run_OD(config_global):
     od_master_header = [
         "master_row_idx",
         "run_uid",
+        "RUN_NUMBER",
         "rank",
         "OD_RUN_UID",
         "OD_RANK",
@@ -4225,6 +4256,19 @@ def run_OD(config_global):
         row = df_master.iloc[m_idx]
 
         config = copy.deepcopy(config_global)
+
+        run_number_raw = row.get("RUN_NUMBER", np.nan)
+        try:
+            simulation_run_number = int(run_number_raw)
+        except Exception:
+            if int(config_global.get("number_of_runs", 1)) == 1:
+                simulation_run_number = 1
+            else:
+                raise RuntimeError(
+                    "MASTER_IOD.csv is missing a valid RUN_NUMBER for "
+                    f"master row {m_idx}. Rerun the IOD-data generation stage "
+                    "so simulation realizations remain unambiguous."
+                )
 
         occluded = int(row["OCCLUDED_BY_EMS"]) == 1
 
@@ -4586,7 +4630,12 @@ def run_OD(config_global):
                             row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                     if timer.curr_od_index > resume_after_step:
-                        _append_row(outer_csv_path, row_out, outer_header)
+                        _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
                     break
 
                 if od_max_steps is not None and timer.curr_od_index >= od_max_steps:
@@ -4653,7 +4702,12 @@ def run_OD(config_global):
                             row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                     if timer.curr_od_index > resume_after_step:
-                        _append_row(outer_csv_path, row_out, outer_header)
+                        _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
                     break
 
                 epoch_start = float(timer.curr_epoch)
@@ -5634,7 +5688,12 @@ def run_OD(config_global):
                                 row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                         if timer.curr_od_index > resume_after_step:
-                            _append_row(outer_csv_path, row_out, outer_header)
+                            _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
 
                         _write_progress(progress_path, {
                             "uid": uid,
@@ -5822,7 +5881,12 @@ def run_OD(config_global):
                                 row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                         if timer.curr_od_index > resume_after_step:
-                            _append_row(outer_csv_path, row_out, outer_header)
+                            _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
 
                         _write_progress(progress_path, {
                             "uid": uid,
@@ -5972,7 +6036,12 @@ def run_OD(config_global):
                                 row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                         if timer.curr_od_index > resume_after_step:
-                            _append_row(outer_csv_path, row_out, outer_header)
+                            _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
                             _write_progress(progress_path, {
                                 "uid": uid,
                                 "last_completed_outer_step": int(timer.curr_od_index),
@@ -6015,11 +6084,41 @@ def run_OD(config_global):
                         progress_status = "completed"
                         event_type = "termination_convergence"
 
-                        sc_states_post = np.asarray(formation.get_spacecraft_states(), dtype=float)
-                        sc_pointings_post = np.asarray(formation.get_spacecraft_pointings(), dtype=float)
+                        terminal_epoch = (
+                            float(processed_epoch_last)
+                            if np.isfinite(processed_epoch_last)
+                            else float(epoch_start)
+                        )
+
+                        # The UKF posterior is at the final processed tracklet
+                        # epoch. Propagate truth to that same epoch before
+                        # reporting terminal errors.
+                        truth_at_terminal = np.asarray(
+                            n_body_propagator.propagate(
+                                minimoon.curr_state_eme,
+                                timer.curr_epoch,
+                                terminal_epoch,
+                            ),
+                            dtype=float,
+                        ).reshape(6)
+
+                        # No attitude command is executed after convergence, but
+                        # the tracklet spacecraft states are available at the
+                        # same terminal epoch.
+                        try:
+                            sc_states_post = np.asarray(
+                                sc_states_k[:, -1, :], dtype=float
+                            ).reshape(num_sc, 6)
+                        except Exception:
+                            sc_states_post = np.asarray(
+                                formation.get_spacecraft_states(), dtype=float
+                            )
+                        sc_pointings_post = np.asarray(
+                            formation.get_spacecraft_pointings(), dtype=float
+                        )
 
                         x_est = _flatten_vec(getattr(ukf, "x", None), 6)
-                        x_true = _flatten_vec(getattr(minimoon, "curr_state_eme", None), 6)
+                        x_true = _flatten_vec(truth_at_terminal, 6)
                         P_diag = _safe_diag(getattr(ukf, "P", None), 6)
                         pos_err, vel_err = _best_effort_state_error(x_est, x_true)
                         true_meas_len, true_meas_norm, true_pair = _summarize_meas_outer(p_meas_k)
@@ -6033,7 +6132,7 @@ def run_OD(config_global):
                             "event_type": event_type,
                             "termination_reason": termination_reason,
                             "epoch_start_jdtdb": epoch_start,
-                            "epoch_end_jdtdb": float(processed_epoch_last) if np.isfinite(processed_epoch_last) else epoch_start,
+                            "epoch_end_jdtdb": terminal_epoch,
                             "processed_epoch_first_jdtdb": processed_epoch_first,
                             "processed_epoch_last_jdtdb": processed_epoch_last,
                             "processed_epoch_count": processed_epoch_count,
@@ -6082,7 +6181,12 @@ def run_OD(config_global):
                                 row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                         if timer.curr_od_index > resume_after_step:
-                            _append_row(outer_csv_path, row_out, outer_header)
+                            _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
 
                         _write_progress(progress_path, {
                             "uid": uid,
@@ -6993,7 +7097,12 @@ def run_OD(config_global):
                         row_out[f"sc{sc_id}_pointing_post_{i}"] = post_u[i]
 
                 if timer.curr_od_index > resume_after_step:
-                    _append_row(outer_csv_path, row_out, outer_header)
+                    _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
                     _write_progress(progress_path, {
                         "uid": uid,
                         "last_completed_outer_step": int(timer.curr_od_index),
@@ -7128,7 +7237,12 @@ def run_OD(config_global):
                         row_out[f"sc{sc_id}_pointing_pre_{i}"] = np.nan
                         row_out[f"sc{sc_id}_pointing_post_{i}"] = np.nan
 
-                _append_row(outer_csv_path, row_out, outer_header)
+                _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
                 _write_progress(progress_path, {
                     "uid": uid,
                     "last_completed_outer_step": clean_final_step,
@@ -7215,7 +7329,12 @@ def run_OD(config_global):
                         row_out[f"sc{sc_id}_pointing_pre_{i}"] = np.nan
                         row_out[f"sc{sc_id}_pointing_post_{i}"] = np.nan
 
-                _append_row(outer_csv_path, row_out, outer_header)
+                _append_outer_row(
+                                outer_csv_path,
+                                row_out,
+                                outer_header,
+                                simulation_run_number=simulation_run_number,
+                            )
                 err_final_epoch = float(getattr(timer, "curr_epoch", np.nan)) if "timer" in locals() else np.nan
                 err_final_step = int(getattr(timer, "curr_od_index", -1)) if "timer" in locals() else -1
                 _write_progress(progress_path, {
@@ -7427,14 +7546,25 @@ def run_overall_OD(master, config):
         comm.Barrier()
 
     # Verify that every MASTER row needed by OD has a committed six-element
-    # IOD state. This prevents a later KeyError or opaque parsing failure.
+    # IOD state. A campaign with zero initial detections has no OD rows, but is
+    # still a valid completed campaign and should proceed to mission summary.
     if rank == 0:
         master_path = os.path.join(top_dir, "MASTER_IOD.csv")
         iod_ready = True
+        od_has_rows = False
         iod_readiness_message = ""
         try:
-            df_check = pd.read_csv(master_path)
-            if "IOD_FINAL_STATE" not in df_check.columns:
+            if not os.path.exists(master_path):
+                df_check = pd.DataFrame()
+            else:
+                df_check = pd.read_csv(master_path)
+
+            if len(df_check) == 0:
+                od_has_rows = False
+                iod_readiness_message = (
+                    "No detected/IOD cases are present; OD will be skipped."
+                )
+            elif "IOD_FINAL_STATE" not in df_check.columns:
                 iod_ready = False
                 iod_readiness_message = (
                     "MASTER_IOD.csv has no IOD_FINAL_STATE column. "
@@ -7442,6 +7572,7 @@ def run_overall_OD(master, config):
                     "IOD row failed."
                 )
             else:
+                od_has_rows = True
                 bad_rows = []
                 for row_index, row in df_check.iterrows():
                     value = row.get("IOD_FINAL_STATE", None)
@@ -7472,14 +7603,17 @@ def run_overall_OD(master, config):
                     )
         except Exception as check_error:
             iod_ready = False
+            od_has_rows = False
             iod_readiness_message = (
                 f"Could not validate MASTER_IOD.csv before OD: {check_error}"
             )
     else:
         iod_ready = None
+        od_has_rows = None
         iod_readiness_message = None
 
     iod_ready = comm.bcast(iod_ready, root=0)
+    od_has_rows = comm.bcast(od_has_rows, root=0)
     iod_readiness_message = comm.bcast(iod_readiness_message, root=0)
     if not iod_ready:
         raise RuntimeError(
@@ -7490,8 +7624,56 @@ def run_overall_OD(master, config):
     # -----------------
     # Stage 4: Run the ATT.COOR. + OD Pipeline
     # ------------------
-    if config['run_OD']:
+    if config['run_OD'] and od_has_rows:
         run_OD(config)
+    elif rank == 0 and config['run_OD']:
+        print(
+            "[Stage: OD] No detected/IOD cases; skipping OD and proceeding "
+            "to mission summary.",
+            flush=True,
+        )
+
+    # All simulation ranks must finish writing before rank 0 reads campaign
+    # outputs and generates the optional mission summary.
+    comm.Barrier()
+    summary_cfg = config.get("mission_summary", {}) or {}
+    summary_error_message = None
+    if rank == 0 and bool(summary_cfg.get("enabled", False)):
+        try:
+            from summarize_mission_outcomes import generate_mission_summary
+
+            summary_paths = generate_mission_summary(config)
+            print(
+                "[Stage: Mission Summary] wrote "
+                + ", ".join(str(path) for path in summary_paths.values()),
+                flush=True,
+            )
+        except Exception as summary_error:
+            summary_error_message = (
+                f"{type(summary_error).__name__}: {summary_error}"
+            )
+            print(
+                f"[Stage: Mission Summary] ERROR: "
+                f"{summary_error_message}",
+                flush=True,
+            )
+            traceback.print_exc()
+
+    # Propagate an optional fatal summary failure to every rank so no worker
+    # remains blocked at an MPI barrier.
+    summary_error_message = comm.bcast(
+        summary_error_message,
+        root=0,
+    )
+    if (
+        summary_error_message is not None
+        and bool(summary_cfg.get("fail_on_error", False))
+    ):
+        raise RuntimeError(
+            "Mission summary generation failed: "
+            + summary_error_message
+        )
+    comm.Barrier()
 
     return
 

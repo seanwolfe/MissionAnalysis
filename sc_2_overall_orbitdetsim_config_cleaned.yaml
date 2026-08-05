@@ -19,9 +19,19 @@ OD_LOAD_BALANCING:
   require_nonempty_outer_for_progress_repair: true
 
 
+mission_summary:
+  enabled: true
+
+  # Relative paths are resolved under top_dir.
+  output_folder: mission_summary
+
+  # false: report an error without invalidating a completed simulation.
+  # true: fail the complete MPI run if summary generation fails.
+  fail_on_error: false
+
 formation_phasing:
   mode: "custom"
-  relative_phase_deg: [0.0, 90.0]
+  relative_phase_deg: [0.0, 30.0]
 
 ###################################
 # paths & file names
@@ -35,13 +45,13 @@ orbit_file_path: 'LPF_orbit_2.csv'
 # minimoon related
 # minimoon_files_folder: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb/'
 # minimoon_files_folder: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb_testset/'
-minimoon_files_folder: 'minimoon_files_oorb_testset/'
-#minimoon_files_folder: '/scratch/wolfesea/minimoon_files_oorb/'
+# minimoon_files_folder: 'minimoon_files_oorb_testset/'
+minimoon_files_folder: '/scratch/wolfesea/minimoon_files_oorb/'
 
 # minimoon_master_file_path: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb/minimoon_master_new.csv'
 # minimoon_master_file_path: '/media/aeromec/Seagate Desktop Drive/minimoon_files_oorb_testset/minimoon_master_new_testset.csv'
-minimoon_master_file_path: 'minimoon_files_oorb_testset/minimoon_master_new_testset.csv'
-#minimoon_master_file_path: '/scratch/wolfesea/minimoon_files_oorb/minimoon_master_with_L1_geo_omega_w_earth.csv'
+# minimoon_master_file_path: 'minimoon_files_oorb_testset/minimoon_master_new_testset.csv'
+minimoon_master_file_path: '/scratch/wolfesea/minimoon_files_oorb/minimoon_master_with_L1_geo_omega_w_earth.csv'
 
 # detection (visible) related
 visible_files_folder: "visible_dir"
@@ -57,8 +67,8 @@ od_file_dir: 'OD_results'
 ####################################################
 # Spacecraft Specifications
 ###################################################
-fov: 17.8  # independent test parameter; not derived from detector dimensions
-number_of_pixels: [2000, 1504]    # height x length
+fov: 0.155848  # degrees squared
+number_of_pixels: [ 2000, 1504 ]  # height x length
 reaction_wheel_torque: 0.007  # Nm
 reaction_wheel_momentum: 0.1  # Nms
 adcs:
@@ -99,7 +109,7 @@ payload_snr:
   enabled: true
   shadow_mode: false  # true mean don't gate with snr Calculate SNR but do not reject geometric detections yet.
   chunk_size: 20000  # Maximum candidate epochs evaluated in one SNR batch.
-  snr_threshold: 0.00001
+  snr_threshold: 3.0
 
   optics:
     aperture_diameter_m: 0.198
