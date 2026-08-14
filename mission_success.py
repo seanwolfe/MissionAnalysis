@@ -8,15 +8,15 @@ from pathlib import Path
 # USER SETTINGS
 # ============================================================
 
-CSV_FILE = Path(r"to_sync/mission_summary/MASTER_IOD.csv")
+CSV_FILE = Path(r"to_sync/results_sc_trade/results_5_fov/MASTER_IOD.csv")
 
 # Sliding-window settings, in days
-WINDOW_LENGTH_DAYS = 365.25 * 5
+WINDOW_LENGTH_DAYS = 365.25 * 5 - 270
 SLIDE_DAYS = 180.0
 
 # Mission success criterion:
 # Minimum number of converged cases required within the window
-MISSION_SUCCESS_THRESHOLD = 3
+MISSION_SUCCESS_THRESHOLD = 3.00
 
 # A run is considered converged when this appears in
 # OD_TERMINATION_REASON

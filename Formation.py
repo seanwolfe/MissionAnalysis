@@ -20,6 +20,16 @@ class Formation:
         self.phase_offset_indices = None
         self.spacecraft_initial_indices = None
 
+        # Mothership is kept separate from ``self.spacecraft`` so the mature
+        # detection/OD algorithms continue to operate on microsatellites only.
+        self.mothership_phase_deg = None
+        self.mothership_realized_phase_deg = None
+        self.mothership_phase_offset_index = None
+        self.mothership_initial_index = None
+        self.mothership_matched_trajectory_full = None
+        self.mothership_curr_state_eme = None
+        self.mothership_curr_epoch = None
+
         self.initial_formation(configs)
 
     def _quasi_halo_period_steps(self, configs):
@@ -153,6 +163,35 @@ class Formation:
             phase_offsets.astype(float) / period_steps * 360.0
         )
 
+        # Optional separate mothership phase.  It is intentionally not appended
+        # to ``self.spacecraft`` because num_spacecraft describes the observing
+        # microsatellite formation throughout the existing OD implementation.
+        phasing = configs.get('formation_phasing', {}) or {}
+        mothership_phase = phasing.get('mothership_phase_deg', None)
+        if mothership_phase is None:
+            self.mothership_phase_deg = None
+            self.mothership_realized_phase_deg = None
+            self.mothership_phase_offset_index = None
+            self.mothership_initial_index = None
+        else:
+            mothership_phase = float(mothership_phase) % 360.0
+            mothership_offset = int(np.rint(
+                mothership_phase / 360.0 * period_steps
+            )) % period_steps
+            if mothership_offset in set(int(value) for value in phase_offsets):
+                raise ValueError(
+                    "The requested mothership phase maps to the same LPF orbit "
+                    "row as a microsatellite phase."
+                )
+            self.mothership_phase_deg = mothership_phase
+            self.mothership_phase_offset_index = mothership_offset
+            self.mothership_initial_index = int(
+                (anchor_index + mothership_offset) % period_steps
+            )
+            self.mothership_realized_phase_deg = float(
+                mothership_offset / period_steps * 360.0
+            )
+
     def initial_formation(self, configs):
         """Create a randomly anchored equal or custom-phased formation."""
         period_steps = self._quasi_halo_period_steps(configs)
@@ -226,7 +265,7 @@ class Formation:
 
         return
 
-    def match_spacecraft_trajectory_full(self, asteroid_length, configs):
+    def match_spacecraft_trajectory_full(self, asteroid_length, configs, *, include_mothership=False):
         """
         Resamples and aligns each spacecraft trajectory to match the asteroid trajectory's
         one-hour intervals and start time.
@@ -336,6 +375,48 @@ class Formation:
 
             self.spacecraft[i].matched_trajectory_full = adjusted_df
 
+        # Build an identically sampled/rotated reference trajectory for the
+        # separate mothership when a mothership phase is configured.
+        if include_mothership and self.mothership_initial_index is not None:
+            start_index = int(self.mothership_initial_index)
+            original_timestamp = orbit.iloc[start_index]["Time"]
+            idx_matches = spacecraft_resampled.index[
+                spacecraft_resampled["Time"] == original_timestamp
+            ]
+            if len(idx_matches) > 0:
+                new_index = int(idx_matches[0])
+            else:
+                new_index = int(
+                    (spacecraft_resampled["Time"] - original_timestamp).abs().argmin()
+                )
+
+            sc_length = len(spacecraft_resampled)
+            ordered_df = pd.concat(
+                [spacecraft_resampled.iloc[new_index:], spacecraft_resampled.iloc[:new_index]],
+                ignore_index=True,
+            ).loc[:, out_cols]
+
+            if sc_length >= asteroid_length:
+                adjusted_df = ordered_df.iloc[:asteroid_length].copy()
+            else:
+                repeats = asteroid_length // sc_length
+                remainder = asteroid_length % sc_length
+                adjusted_df = pd.concat(
+                    [ordered_df] * repeats + [ordered_df.iloc[:remainder]],
+                    ignore_index=True,
+                )
+
+            vel_cols = [c for c in numeric_cols if "(km/s)" in c]
+            if vel_cols:
+                adjusted_df[vel_cols] = adjusted_df[vel_cols] * (SEC_PER_DAY / AU_km)
+            pos_cols = [
+                c for c in numeric_cols if "(km)" in c and "(km/s)" not in c
+            ]
+            if pos_cols:
+                adjusted_df[pos_cols] = adjusted_df[pos_cols] / AU_km
+
+            self.mothership_matched_trajectory_full = adjusted_df
+
         # Write back cleaned orbit if you want side effects to persist
         self.orbit = orbit.drop(columns=["ROW_ID"])
 
@@ -383,6 +464,61 @@ class Formation:
             histories.append(values)
 
         return np.stack(histories, axis=1)
+
+    def initialize_mothership_state_from_matched_index(
+            self, index, current_epoch, configs
+    ):
+        """Initialize the separate mothership EME state at a simulation index.
+
+        ``match_spacecraft_trajectory_full`` stores legacy ``(km)``/``(km/s)``
+        columns internally as AU/AU-day, so this method converts the EME state
+        back to km and km/s before placing it on the live OD timeline.
+        """
+        trajectory = self.mothership_matched_trajectory_full
+        if trajectory is None:
+            raise RuntimeError(
+                "Mothership matched trajectory is unavailable. Configure "
+                "formation_phasing.mothership_phase_deg and call "
+                "match_spacecraft_trajectory_full first."
+            )
+        index = int(index)
+        if index < 0 or index >= len(trajectory):
+            raise IndexError(
+                f"Mothership matched-trajectory index {index} is outside "
+                f"[0, {len(trajectory) - 1}]."
+            )
+        columns = [
+            'GEO_EME_X_(km)', 'GEO_EME_Y_(km)', 'GEO_EME_Z_(km)',
+            'GEO_EME_Vx_(km/s)', 'GEO_EME_Vy_(km/s)', 'GEO_EME_Vz_(km/s)',
+        ]
+        missing = [column for column in columns if column not in trajectory.columns]
+        if missing:
+            raise KeyError(
+                "Mothership matched trajectory is missing EME state columns: "
+                f"{missing}."
+            )
+        state = trajectory.loc[index, columns].to_numpy(dtype=float)
+        au_km = float(configs['AU_TO_M']) / float(configs['KM_TO_M'])
+        seconds_per_day = float(configs['SECONDS_PER_DAY'])
+        state[:3] *= au_km
+        state[3:] *= au_km / seconds_per_day
+        self.mothership_curr_state_eme = state.reshape(6)
+        self.mothership_curr_epoch = float(current_epoch)
+        return self.mothership_curr_state_eme.copy()
+
+    def get_mothership_state(self):
+        if self.mothership_curr_state_eme is None:
+            raise RuntimeError("Mothership current EME state has not been initialized.")
+        return np.asarray(self.mothership_curr_state_eme, dtype=float).reshape(6).copy()
+
+    def set_mothership_state(self, state_eme, epoch=None):
+        state = np.asarray(state_eme, dtype=float).reshape(6)
+        if np.any(~np.isfinite(state)):
+            raise ValueError("Mothership EME state must be finite.")
+        self.mothership_curr_state_eme = state.copy()
+        if epoch is not None:
+            self.mothership_curr_epoch = float(epoch)
+        return
 
     def get_index_from_pos(self, position):
         possible_positions = self.orbit.loc[:, ['SUN_EARTH_CO_X_(km)', 'SUN_EARTH_CO_Y_(km)', 'SUN_EARTH_CO_Z_(km)']]

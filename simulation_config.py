@@ -515,6 +515,184 @@ def normalize_simulation_config(
         "adcs.slew_authority_factor",
     )
 
+    # ------------------------------------------------------------------
+    # Dynamic mothership/microsatellite crosslink timing.
+    # ------------------------------------------------------------------
+    communications = cfg.get("communications", {}) or {}
+    if not isinstance(communications, Mapping):
+        raise TypeError("communications must be a YAML mapping.")
+    communications = deepcopy(dict(communications))
+    cfg["communications"] = communications
+
+    communications_enabled = communications.get("enabled", False)
+    if not isinstance(communications_enabled, bool):
+        raise TypeError("communications.enabled must be boolean.")
+    communications["enabled"] = communications_enabled
+
+    comm_diagnostics = communications.get("diagnostics", {}) or {}
+    if not isinstance(comm_diagnostics, Mapping):
+        raise TypeError("communications.diagnostics must be a YAML mapping.")
+    comm_diagnostics = deepcopy(dict(comm_diagnostics))
+    comm_diag_enabled = comm_diagnostics.get("enabled", True)
+    if not isinstance(comm_diag_enabled, bool):
+        raise TypeError("communications.diagnostics.enabled must be boolean.")
+    comm_diagnostics["enabled"] = comm_diag_enabled
+    communications["diagnostics"] = comm_diagnostics
+
+    if communications_enabled:
+        crosslink = communications.get("crosslink")
+        if not isinstance(crosslink, Mapping):
+            raise TypeError(
+                "communications.crosslink must be a YAML mapping when "
+                "communications.enabled is true."
+            )
+        crosslink = deepcopy(dict(crosslink))
+        communications["crosslink"] = crosslink
+        crosslink["bitrate_bps"] = _positive(
+            crosslink["bitrate_bps"],
+            "communications.crosslink.bitrate_bps",
+        )
+        crosslink["measurement_packet_size_bits"] = _positive(
+            crosslink["measurement_packet_size_bits"],
+            "communications.crosslink.measurement_packet_size_bits",
+        )
+        crosslink["command_packet_size_bits"] = _positive(
+            crosslink["command_packet_size_bits"],
+            "communications.crosslink.command_packet_size_bits",
+        )
+        crosslink["settle_time_sec"] = _nonnegative(
+            crosslink["settle_time_sec"],
+            "communications.crosslink.settle_time_sec",
+        )
+        crosslink["acquisition_time_sec"] = _nonnegative(
+            crosslink["acquisition_time_sec"],
+            "communications.crosslink.acquisition_time_sec",
+        )
+
+        mothership = cfg.get("mothership")
+        if not isinstance(mothership, Mapping):
+            raise TypeError(
+                "mothership must be a YAML mapping when communications.enabled "
+                "is true."
+            )
+        mothership = deepcopy(dict(mothership))
+        cfg["mothership"] = mothership
+        mothership["mass"] = _positive(mothership["mass"], "mothership.mass")
+
+        dimensions = mothership.get("dimensions_m")
+        if not isinstance(dimensions, (list, tuple)) or len(dimensions) != 3:
+            raise ValueError(
+                "mothership.dimensions_m must contain exactly [Lx, Ly, Lz] in metres."
+            )
+        dimensions = [
+            _positive(value, f"mothership.dimensions_m[{idx}]")
+            for idx, value in enumerate(dimensions)
+        ]
+        mothership["dimensions_m"] = dimensions
+        mothership["reaction_wheel_torque"] = _positive(
+            mothership["reaction_wheel_torque"],
+            "mothership.reaction_wheel_torque",
+        )
+        mothership["reaction_wheel_momentum"] = _positive(
+            mothership["reaction_wheel_momentum"],
+            "mothership.reaction_wheel_momentum",
+        )
+
+        mothership_adcs = mothership.get("adcs")
+        if not isinstance(mothership_adcs, Mapping):
+            raise TypeError("mothership.adcs must be a YAML mapping.")
+        mothership_adcs = deepcopy(dict(mothership_adcs))
+        mothership["adcs"] = mothership_adcs
+        authority = _positive(
+            mothership_adcs["slew_authority_factor"],
+            "mothership.adcs.slew_authority_factor",
+        )
+        mothership_adcs["slew_authority_factor"] = authority
+
+        lx, ly, lz = dimensions
+        mass = mothership["mass"]
+        inertia_components = [
+            mass * (ly * ly + lz * lz) / 12.0,
+            mass * (lx * lx + lz * lz) / 12.0,
+            mass * (lx * lx + ly * ly) / 12.0,
+        ]
+        i_max_calculated = max(inertia_components)
+        override = mothership_adcs.get("I_max_override_kg_m2", None)
+        if override is None:
+            i_max_override = None
+            i_max_used = i_max_calculated
+            i_max_source = "calculated_cuboid"
+        else:
+            i_max_override = _positive(
+                override,
+                "mothership.adcs.I_max_override_kg_m2",
+            )
+            mothership_adcs["I_max_override_kg_m2"] = i_max_override
+            i_max_used = i_max_override
+            i_max_source = "override"
+
+        alpha_max = (
+            authority * mothership["reaction_wheel_torque"] / i_max_used
+        )
+        omega_max = (
+            authority * mothership["reaction_wheel_momentum"] / i_max_used
+        )
+        mothership["derived"] = {
+            "I_components_kg_m2": inertia_components,
+            "I_max_calculated_kg_m2": i_max_calculated,
+            "I_max_override_kg_m2": i_max_override,
+            "I_max_used_kg_m2": i_max_used,
+            "I_max_source": i_max_source,
+            "alpha_max_rad_s2": alpha_max,
+            "omega_max_rad_s": omega_max,
+        }
+
+        phasing = cfg.get("formation_phasing", {}) or {}
+        if not isinstance(phasing, Mapping):
+            raise TypeError("formation_phasing must be a YAML mapping.")
+        phasing = deepcopy(dict(phasing))
+        cfg["formation_phasing"] = phasing
+        if "mothership_phase_deg" not in phasing:
+            raise KeyError(
+                "formation_phasing.mothership_phase_deg is required when "
+                "communications.enabled is true."
+            )
+        mothership_phase_deg = float(phasing["mothership_phase_deg"])
+        if not math.isfinite(mothership_phase_deg):
+            raise ValueError("formation_phasing.mothership_phase_deg must be finite.")
+        mothership_phase_deg %= 360.0
+        phasing["mothership_phase_deg"] = mothership_phase_deg
+
+        mode = str(phasing.get("mode", "equal")).strip().lower()
+        num_spacecraft = int(cfg["num_spacecraft"])
+        if mode == "equal":
+            spacecraft_phases = [
+                360.0 * idx / num_spacecraft for idx in range(num_spacecraft)
+            ]
+        elif mode == "custom":
+            raw_phases = phasing.get("relative_phase_deg")
+            if not isinstance(raw_phases, (list, tuple)) or len(raw_phases) != num_spacecraft:
+                raise ValueError(
+                    "formation_phasing.relative_phase_deg must contain exactly "
+                    "num_spacecraft entries when mode is 'custom'."
+                )
+            spacecraft_phases = [float(value) % 360.0 for value in raw_phases]
+            if any(not math.isfinite(value) for value in spacecraft_phases):
+                raise ValueError("All relative spacecraft phases must be finite.")
+        else:
+            raise ValueError(
+                "formation_phasing.mode must be 'equal' or 'custom'."
+            )
+
+        if any(
+            _close(mothership_phase_deg, phase, rtol=0.0, atol=1.0e-12)
+            for phase in spacecraft_phases
+        ):
+            raise ValueError(
+                "formation_phasing.mothership_phase_deg must not coincide with "
+                "a microsatellite phase."
+            )
+
     spice_cfg = cfg.get("spice")
     if not isinstance(spice_cfg, Mapping):
         raise TypeError("spice must be a YAML mapping.")

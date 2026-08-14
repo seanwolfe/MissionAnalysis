@@ -88,20 +88,32 @@ class SimTime:
             int(math.ceil((big_h * big_l) / (patch_h * patch_l))) + 1
         ) * self.detection_patchtime
 
-        # Additional operational delays. Defaults preserve legacy behavior.
+        # Additional operational delays.  When the dynamic communications model
+        # is enabled, the two crosslink times are refreshed by the OD loop once
+        # per cycle via ``set_communication_times``.  Otherwise the legacy fixed
+        # timing values remain available for backward compatibility.
         timing = configs.get("timing", {}) or {}
         self.preprocessing_time = self._nonnegative_seconds(
             timing.get("preprocessing_time_sec", 0.0),
             "timing.preprocessing_time_sec",
         )
-        self.measurement_comm_time = self._nonnegative_seconds(
-            timing.get("measurement_comm_time_sec", 0.0),
-            "timing.measurement_comm_time_sec",
+        communications = configs.get("communications", {}) or {}
+        self.dynamic_communications_enabled = bool(
+            communications.get("enabled", False)
         )
-        self.boresight_comm_time = self._nonnegative_seconds(
-            timing.get("boresight_comm_time_sec", 0.0),
-            "timing.boresight_comm_time_sec",
-        )
+        if self.dynamic_communications_enabled:
+            self.measurement_comm_time = 0.0
+            self.boresight_comm_time = 0.0
+        else:
+            self.measurement_comm_time = self._nonnegative_seconds(
+                timing.get("measurement_comm_time_sec", 0.0),
+                "timing.measurement_comm_time_sec",
+            )
+            self.boresight_comm_time = self._nonnegative_seconds(
+                timing.get("boresight_comm_time_sec", 0.0),
+                "timing.boresight_comm_time_sec",
+            )
+        self.last_communication_metadata = {}
 
         self.iod_time = None if iod_time is None else float(iod_time)
         self.slew_time = None  # selected slew duration [s]
@@ -117,6 +129,21 @@ class SimTime:
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and non-negative.")
         return value
+
+    def set_communication_times(
+            self, measurement_time_sec, boresight_time_sec, metadata=None
+    ):
+        """Set formation-level crosslink delays for the current OD cycle."""
+        self.measurement_comm_time = self._nonnegative_seconds(
+            measurement_time_sec,
+            "dynamic measurement communication time",
+        )
+        self.boresight_comm_time = self._nonnegative_seconds(
+            boresight_time_sec,
+            "dynamic boresight-command communication time",
+        )
+        self.last_communication_metadata = dict(metadata or {})
+        return
 
     def _navigation_time_seconds(self, od_time=None):
         """Return the applicable IOD/OD computation delay for this cycle."""

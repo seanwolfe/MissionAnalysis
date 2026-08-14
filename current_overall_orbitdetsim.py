@@ -31,6 +31,7 @@ from payload_snr_adapter import PayloadSNREvaluator
 from initial_boresight_packing import compute_initial_boresight_history
 from earth_moon_invisibility_zone import query_moon_positions_geo_eme_km
 from simulation_config import load_simulation_config, load_spice_kernels
+from communications_timing import CommunicationsTimingModel
 
 
 
@@ -2736,8 +2737,9 @@ def run_OD(config_global):
       - one outer-loop CSV per run in a common folder
       - optional per-run detailed CSVs:
             * inner_kf_updates.csv
-            * attcoord_candidates.csv
+            * attcoord_candidates_v2.csv
             * optimizer_history.csv
+            * communications.csv (when dynamic communications diagnostics are enabled)
       - per-run progress marker for resume
       - final termination row on no-detection / time-limit / step-limit / error
 
@@ -2942,6 +2944,53 @@ def run_OD(config_global):
         except Exception:
             return np.nan
 
+    def _sync_mothership_to_epoch(formation, target_epoch_jdtdb, propagator):
+        """Propagate the separate mothership state onto the live OD epoch."""
+        if getattr(formation, "mothership_curr_state_eme", None) is None:
+            raise RuntimeError(
+                "Dynamic communications are enabled but the mothership state "
+                "has not been initialized."
+            )
+        target_epoch = float(target_epoch_jdtdb)
+        current_epoch = getattr(formation, "mothership_curr_epoch", None)
+        if current_epoch is None:
+            raise RuntimeError("Mothership current epoch has not been initialized.")
+        current_epoch = float(current_epoch)
+        if abs(target_epoch - current_epoch) <= 1.0e-15:
+            formation.mothership_curr_epoch = target_epoch
+            return formation.get_mothership_state()
+
+        propagated = propagator.propagate(
+            formation.get_mothership_state(),
+            current_epoch,
+            np.asarray([target_epoch], dtype=float),
+        )
+        propagated = np.asarray(propagated, dtype=float).reshape(-1, 6)
+        formation.set_mothership_state(propagated[-1], epoch=target_epoch)
+        return formation.get_mothership_state()
+
+    def _append_communications_diagnostics(
+            csv_path, plan, *, uid, m_idx, rank, simulation_run_number,
+            od_step_idx, epoch_jdtdb, include_measurement, include_command,
+            diagnostics_enabled, header
+    ):
+        if plan is None or not diagnostics_enabled:
+            return
+        for row in plan.diagnostic_rows(
+            include_measurement=bool(include_measurement),
+            include_command=bool(include_command),
+        ):
+            enriched = {
+                "run_uid": uid,
+                "run_number": int(simulation_run_number),
+                "master_row_idx": int(m_idx),
+                "rank": int(rank),
+                "od_step_idx": int(od_step_idx),
+                "epoch_jdtdb": float(epoch_jdtdb),
+            }
+            enriched.update(row)
+            _append_row(csv_path, enriched, header)
+
     def _append_row(csv_path, row_dict, header):
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         exists = os.path.exists(csv_path)
@@ -3053,6 +3102,12 @@ def run_OD(config_global):
             "formation_states_eme": np.asarray(formation.get_spacecraft_states(), dtype=float).copy(),
             "formation_pointings_eme": np.asarray(formation.get_spacecraft_pointings(), dtype=float).copy(),
             "formation_sc_epochs": _get_sc_epochs(formation),
+            "mothership_curr_state_eme": (
+                None
+                if getattr(formation, "mothership_curr_state_eme", None) is None
+                else np.asarray(formation.mothership_curr_state_eme, dtype=float).reshape(6).copy()
+            ),
+            "mothership_curr_epoch": getattr(formation, "mothership_curr_epoch", None),
             "currently_detecting": tuple(int(x) for x in np.asarray(getattr(formation, "currently_detecting", ()), dtype=int).reshape(-1)),
             "od_convergence_streak": int(od_convergence_streak),
             "last_od_stop_metrics": copy.deepcopy(last_od_stop_metrics),
@@ -3080,6 +3135,12 @@ def run_OD(config_global):
         formation.set_spacecraft_states(np.asarray(chk["formation_states_eme"], dtype=float).reshape(-1, 6))
         formation.set_spacecraft_pointings(np.asarray(chk["formation_pointings_eme"], dtype=float).reshape(-1, 3))
         _set_sc_epochs(formation, chk.get("formation_sc_epochs", None))
+        mothership_state = chk.get("mothership_curr_state_eme", None)
+        if mothership_state is not None:
+            formation.set_mothership_state(
+                np.asarray(mothership_state, dtype=float).reshape(6),
+                epoch=chk.get("mothership_curr_epoch", timer.curr_epoch),
+            )
         formation.currently_detecting = tuple(int(x) for x in np.asarray(chk.get("currently_detecting", ()), dtype=int).reshape(-1))
         _restore_np_random_state(chk.get("rng_state_numpy", None))
         return int(chk.get("od_convergence_streak", 0)), copy.deepcopy(chk.get("last_od_stop_metrics", {}))
@@ -3872,6 +3933,8 @@ def run_OD(config_global):
     log_attcoord = bool(diag_cfg.get("log_attcoord_candidates", False))
     log_optimizer = bool(diag_cfg.get("log_optimizer_history", False))
 
+    communications_model = CommunicationsTimingModel(config_global)
+
     checkpoint_cfg = config_global.get("od_checkpoint", {})
     checkpoint_enabled_default = True
     checkpoint_enabled = bool(checkpoint_cfg.get("enabled", checkpoint_enabled_default))
@@ -4106,6 +4169,17 @@ def run_OD(config_global):
         "tracking_anchor_feasible",
         "od_time_sec",
         "attcoord_time_sec",
+        "measurement_comm_time_sec",
+        "command_comm_time_sec",
+        "comm_total_time_sec",
+        "comm_total_slew_time_sec",
+        "comm_total_settle_time_sec",
+        "comm_total_acquisition_time_sec",
+        "comm_total_tx_time_sec",
+        "comm_total_propagation_time_sec",
+        "comm_max_range_km",
+        "comm_max_slew_angle_deg",
+        "comm_contact_order",
         "true_meas_len",
         "true_meas_norm",
         "true_meas_0",
@@ -4145,6 +4219,31 @@ def run_OD(config_global):
         "progress_status",
     ]
 
+    communications_header = [
+        "run_uid",
+        "run_number",
+        "master_row_idx",
+        "rank",
+        "od_step_idx",
+        "epoch_jdtdb",
+        "stage",
+        "contact_sequence",
+        "spacecraft_index",
+        "spacecraft_id",
+        "spacecraft_phase_deg",
+        "phase_distance_behind_mothership_deg",
+        "range_km",
+        "slew_angle_deg",
+        "slew_time_sec",
+        "settle_time_sec",
+        "acquisition_time_sec",
+        "packet_size_bits",
+        "bitrate_bps",
+        "tx_time_sec",
+        "propagation_time_sec",
+        "total_contact_time_sec",
+    ]
+
     inner_header = [
         "run_uid",
         "master_row_idx",
@@ -4168,9 +4267,36 @@ def run_OD(config_global):
         "master_row_idx",
         "rank",
         "od_step_idx",
+        "attcoord_phase",
+        "anchor_attempt_number",
+        "anchor_requested_sid",
+        "anchor_result_feasible",
+        "anchor_release_reason",
+        "is_final_attempt",
+        "final_mode",
+        "final_anchor_sid",
         "candidate_idx",
+        "candidate_dt_sec",
         "candidate_epoch_jdtdb",
         "is_chosen",
+        "feasible",
+        "failure_stage",
+        "failure_reason",
+        "cost",
+        "J",
+        "coverage",
+        "coverage_mode",
+        "theta_s_allowed_deg",
+        "use_fixed_agent",
+        "fixed_agent_idx",
+        "fixed_agent_u_mode",
+        "fixed_agent_feasible",
+        "fixed_agent_infeasible_reason",
+        "fixed_agent_theta_req_deg",
+        "optimizer_returned_solution",
+        "optimizer_cost_pre_iv",
+        "optimizer_J_pre_iv",
+        "hard_iv_pass",
     ]
     attcoord_header += [f"x_pred_{i}" for i in range(6)]
     attcoord_header += [f"P_pred_diag_{i}" for i in range(6)]
@@ -4178,7 +4304,14 @@ def run_OD(config_global):
         attcoord_header += [f"sc{sc_id}_state_{i}" for i in range(6)]
     for sc_id in range(num_sc):
         attcoord_header += [f"u_cmd_sc{sc_id}_{i}" for i in range(3)]
-    attcoord_header += ["J", "coverage_score"]
+    for sc_id in range(num_sc):
+        attcoord_header += [
+            f"iv_safe_sc{sc_id}",
+            f"iv_axis_angle_to_boresight_sc{sc_id}_deg",
+            f"iv_required_axis_sep_sc{sc_id}_deg",
+            f"iv_fov_edge_clearance_sc{sc_id}_deg",
+            f"iv_clearance_margin_sc{sc_id}_deg",
+        ]
 
     optimizer_header = [
         "run_uid",
@@ -4256,6 +4389,150 @@ def run_OD(config_global):
     for sc_id in range(num_sc):
         od_master_header += [f"OD_FINAL_SC{sc_id}_STATE", f"OD_FINAL_SC{sc_id}_POINTING"]
 
+    def _log_attcoord_attempt_records(
+        *,
+        attcoord_csv_path,
+        uid,
+        m_idx,
+        timer,
+        x_ts,
+        P_ts,
+        sc_states_ts,
+        attempt_records,
+        final_result,
+        final_mode,
+        final_anchor_sid,
+        phase,
+        resume_after_step,
+    ):
+        """Write one compact diagnostic row per candidate and anchor attempt.
+
+        Logging happens before the selected candidate is applied so an all-NaN
+        attitude-coordination result is still diagnosable.  This function does
+        not alter optimizer or OD state.
+        """
+        if not log_attcoord or int(timer.curr_od_index) <= int(resume_after_step):
+            return
+
+        searchtimes = np.asarray(timer.attcoord_searchtimes, dtype=float).reshape(-1)
+        searchtimes_jdtdb = np.asarray(timer.attcoord_searchtimes_jdtdb, dtype=float).reshape(-1)
+        x_hist = np.asarray(x_ts)
+        P_hist = np.asarray(P_ts)
+        sc_hist = np.asarray(sc_states_ts)
+
+        final_chosen_dt = _safe_scalar(getattr(final_result, "chosen_dt", np.nan))
+        final_chosen_idx = None
+        if np.isfinite(final_chosen_dt):
+            close = np.where(np.isclose(searchtimes, final_chosen_dt, rtol=0.0, atol=1.0e-12))[0]
+            if close.size:
+                final_chosen_idx = int(close[0])
+
+        n_attempts = len(attempt_records)
+        for attempt_pos, attempt in enumerate(attempt_records, start=1):
+            series = attempt.get("series", []) or []
+            is_final_attempt = bool(attempt_pos == n_attempts)
+            anchor_sid = attempt.get("anchor_requested_sid", None)
+            anchor_feasible = bool(attempt.get("anchor_result_feasible", False))
+            anchor_release_reason = str(attempt.get("anchor_release_reason", "") or "")
+
+            for cand_idx in range(len(searchtimes_jdtdb)):
+                result_row = series[cand_idx] if cand_idx < len(series) and isinstance(series[cand_idx], dict) else {}
+                feasible = bool(result_row.get("feasible", False))
+
+                row_att = {
+                    "run_uid": uid,
+                    "master_row_idx": m_idx,
+                    "rank": rank,
+                    "od_step_idx": int(timer.curr_od_index),
+                    "attcoord_phase": str(phase),
+                    "anchor_attempt_number": int(attempt_pos),
+                    "anchor_requested_sid": (np.nan if anchor_sid is None else int(anchor_sid)),
+                    "anchor_result_feasible": int(anchor_feasible),
+                    "anchor_release_reason": anchor_release_reason,
+                    "is_final_attempt": int(is_final_attempt),
+                    "final_mode": str(final_mode),
+                    "final_anchor_sid": (np.nan if final_anchor_sid is None else int(final_anchor_sid)),
+                    "candidate_idx": int(cand_idx),
+                    "candidate_dt_sec": _safe_scalar(result_row.get("dt", searchtimes[cand_idx])),
+                    "candidate_epoch_jdtdb": float(searchtimes_jdtdb[cand_idx]),
+                    "is_chosen": int(bool(is_final_attempt and final_chosen_idx is not None and cand_idx == final_chosen_idx)),
+                    "feasible": int(feasible),
+                    "failure_stage": str(result_row.get("failure_stage", "")),
+                    "failure_reason": str(result_row.get("failure_reason", "")),
+                    "cost": _safe_scalar(result_row.get("cost", np.nan)),
+                    "J": _safe_scalar(result_row.get("J", np.nan)),
+                    "coverage": _safe_scalar(result_row.get("coverage", np.nan)),
+                    "coverage_mode": str(result_row.get("coverage_mode", "") or ""),
+                    "theta_s_allowed_deg": (
+                        float(np.rad2deg(_safe_scalar(result_row.get("theta_s_allowed", np.nan))))
+                        if np.isfinite(_safe_scalar(result_row.get("theta_s_allowed", np.nan)))
+                        else np.nan
+                    ),
+                    "use_fixed_agent": int(bool(result_row.get("use_fixed_agent", False))),
+                    "fixed_agent_idx": (
+                        np.nan if result_row.get("fixed_agent_idx", None) is None
+                        else int(result_row.get("fixed_agent_idx"))
+                    ),
+                    "fixed_agent_u_mode": str(result_row.get("fixed_agent_u_mode", "") or ""),
+                    "fixed_agent_feasible": int(bool(result_row.get("fixed_agent_feasible", False))),
+                    "fixed_agent_infeasible_reason": str(result_row.get("fixed_agent_infeasible_reason", "") or ""),
+                    "fixed_agent_theta_req_deg": _safe_scalar(result_row.get("fixed_agent_theta_req_deg", np.nan)),
+                    "optimizer_returned_solution": int(bool(result_row.get("optimizer_returned_solution", False))),
+                    "optimizer_cost_pre_iv": _safe_scalar(result_row.get("optimizer_cost_pre_iv", np.nan)),
+                    "optimizer_J_pre_iv": _safe_scalar(result_row.get("optimizer_J_pre_iv", np.nan)),
+                    "hard_iv_pass": (
+                        np.nan
+                        if result_row.get("hard_iv_pass", None) is None or (
+                            isinstance(result_row.get("hard_iv_pass"), float)
+                            and not np.isfinite(result_row.get("hard_iv_pass"))
+                        )
+                        else int(bool(result_row.get("hard_iv_pass")))
+                    ),
+                }
+
+                xpred = _flatten_vec(x_hist[cand_idx], 6)
+                Ppred = _safe_diag(P_hist[cand_idx], 6)
+                for i in range(6):
+                    row_att[f"x_pred_{i}"] = xpred[i]
+                    row_att[f"P_pred_diag_{i}"] = Ppred[i]
+
+                sc_cand = np.asarray(sc_hist[cand_idx], dtype=float)
+                for sc_id in range(num_sc):
+                    vals = _flatten_vec(sc_cand[sc_id], 6)
+                    for i in range(6):
+                        row_att[f"sc{sc_id}_state_{i}"] = vals[i]
+
+                u_cand = result_row.get("u", None)
+                if u_cand is None:
+                    u_cand = result_row.get("u_pre_iv", None)
+                if u_cand is None:
+                    u_cand = np.full((num_sc, 3), np.nan)
+                u_cand = np.asarray(u_cand, dtype=float)
+                if u_cand.ndim == 1:
+                    u_cand = u_cand.reshape(-1, 3)
+                for sc_id in range(num_sc):
+                    vals = _flatten_vec(u_cand[sc_id] if sc_id < u_cand.shape[0] else None, 3)
+                    for i in range(3):
+                        row_att[f"u_cmd_sc{sc_id}_{i}"] = vals[i]
+
+                iv_safe = result_row.get("iv_safe_flags", None)
+                iv_axis = np.asarray(result_row.get("iv_axis_angle_to_boresight_deg", np.full(num_sc, np.nan)), dtype=float).reshape(-1)
+                iv_req = np.asarray(result_row.get("iv_required_axis_sep_deg", np.full(num_sc, np.nan)), dtype=float).reshape(-1)
+                iv_edge = np.asarray(result_row.get("iv_fov_edge_clearance_deg", np.full(num_sc, np.nan)), dtype=float).reshape(-1)
+                iv_margin = np.asarray(result_row.get("iv_clearance_margin_deg", np.full(num_sc, np.nan)), dtype=float).reshape(-1)
+                iv_safe_arr = None if iv_safe is None else np.asarray(iv_safe).reshape(-1)
+
+                for sc_id in range(num_sc):
+                    row_att[f"iv_safe_sc{sc_id}"] = (
+                        np.nan if iv_safe_arr is None or sc_id >= iv_safe_arr.size else int(bool(iv_safe_arr[sc_id]))
+                    )
+                    row_att[f"iv_axis_angle_to_boresight_sc{sc_id}_deg"] = float(iv_axis[sc_id]) if sc_id < iv_axis.size else np.nan
+                    row_att[f"iv_required_axis_sep_sc{sc_id}_deg"] = float(iv_req[sc_id]) if sc_id < iv_req.size else np.nan
+                    row_att[f"iv_fov_edge_clearance_sc{sc_id}_deg"] = float(iv_edge[sc_id]) if sc_id < iv_edge.size else np.nan
+                    row_att[f"iv_clearance_margin_sc{sc_id}_deg"] = float(iv_margin[sc_id]) if sc_id < iv_margin.size else np.nan
+
+                _append_row(attcoord_csv_path, row_att, attcoord_header)
+
     # ---------------------------------------------------------
     # Main row loop
     # ---------------------------------------------------------
@@ -4301,8 +4578,9 @@ def run_OD(config_global):
         run_dir = os.path.join(detail_root, uid)
         progress_path = os.path.join(run_dir, "progress.json")
         inner_csv_path = os.path.join(run_dir, "inner_kf_updates.csv")
-        attcoord_csv_path = os.path.join(run_dir, "attcoord_candidates.csv")
+        attcoord_csv_path = os.path.join(run_dir, "attcoord_candidates_v2.csv")
         optimizer_csv_path = os.path.join(run_dir, "optimizer_history.csv")
+        communications_csv_path = os.path.join(run_dir, "communications.csv")
         checkpoint_path = _checkpoint_path_for(run_dir, checkpoint_name)
         row_paused_for_walltime = False
 
@@ -4405,7 +4683,11 @@ def run_OD(config_global):
             formation = Formation(config)
             sc1_ini_index = formation.get_index_from_pos(util.parse_vec_cell(row["SPACECRAFT_1_INI_POS(km)"]))
             formation.recall_formation(sc1_ini_index, config)
-            formation.match_spacecraft_trajectory_full(int(row['TOTAL_LENGTH']), config)
+            formation.match_spacecraft_trajectory_full(
+                int(row['TOTAL_LENGTH']),
+                config,
+                include_mothership=communications_model.enabled,
+            )
             formation.set_spacecraft_states(
                 setup["frames"]["sc_eme_ae_kms"],
                 set_epochs_from_row=row
@@ -4413,6 +4695,13 @@ def run_OD(config_global):
 
             formation.set_spacecraft_pointings(setup["frames"]["sc_pointing_eme_cartesian"])
             formation.currently_detecting = tuple([int(setup["sc_detecting_id"])])
+
+            if communications_model.enabled:
+                formation.initialize_mothership_state_from_matched_index(
+                    int(row["INDEX_USED"]),
+                    current_epoch=float(row["EPOCH_AST(jdtdb)"]),
+                    configs=config,
+                )
 
             # Tracking-anchor custody queue: oldest still-detecting spacecraft
             # remains anchor; new detectors are appended behind it.
@@ -4547,6 +4836,8 @@ def run_OD(config_global):
                     f"od_step_idx={timer.curr_od_index}, epoch_jdtdb={timer.curr_epoch}",
                     flush=True,
                 )
+            
+            print("OD Sim Initialized") 
 
             while True:
                 if _walltime_near_limit(job_start_time, walltime_cfg):
@@ -4574,6 +4865,30 @@ def run_OD(config_global):
                     row_paused_for_walltime = True
                     print(f"[OD r{rank} uid={uid}] Pausing before walltime limit; checkpoint saved.", flush=True)
                     break
+
+                # Recompute crosslink timing once per OD cycle from the actual
+                # current mothership/microsatellite geometry.  Both communication
+                # sequences start Earth-pointing and use the configured deployment
+                # order; SimTime later decides whether the measurement stage is
+                # applicable for this cycle.
+                communication_plan_for_cycle = None
+                comm_outer_summary = {}
+                if communications_model.enabled:
+                    _sync_mothership_to_epoch(
+                        formation, timer.curr_epoch, n_body_propagator
+                    )
+                    communication_plan_for_cycle = communications_model.evaluate_cycle(
+                        formation.get_mothership_state(),
+                        formation.get_spacecraft_states(),
+                    )
+                    timer.set_communication_times(
+                        communication_plan_for_cycle.measurement.total_time_sec,
+                        communication_plan_for_cycle.command.total_time_sec,
+                        metadata={
+                            "contact_order": communication_plan_for_cycle.command.contact_order_ids,
+                            "geometry_epoch_jdtdb": float(timer.curr_epoch),
+                        },
+                    )
 
                 if timer.curr_epoch > timer.end_time or timer.check_search_times():
                     print("Over Time")
@@ -4745,15 +5060,35 @@ def run_OD(config_global):
                 chosen_candidate_epoch_jdtdb = np.nan
                 p_meas_k = None
                 n_meas_k = None
-
+            
                 # update according to iod
                 if timer.curr_od_index == 0:
+                    print("Starting OD step 0")
                     event_type = "initial_attcoord"
 
                     # -------------- REGULAR IOD STEP -------------------
                     attcoord_startime = time.time()
 
                     timer.set_attcoord_searchtimes()
+                    if communication_plan_for_cycle is not None:
+                        comm_outer_summary = communication_plan_for_cycle.outer_summary(
+                            include_measurement=True,
+                            include_command=True,
+                        )
+                        _append_communications_diagnostics(
+                            communications_csv_path,
+                            communication_plan_for_cycle,
+                            uid=uid,
+                            m_idx=m_idx,
+                            rank=rank,
+                            simulation_run_number=simulation_run_number,
+                            od_step_idx=int(timer.curr_od_index) + 1,
+                            epoch_jdtdb=float(timer.curr_epoch),
+                            include_measurement=True,
+                            include_command=True,
+                            diagnostics_enabled=communications_model.diagnostics_enabled,
+                            header=communications_header,
+                        )
                     _validate_attcoord_search_grid(timer, min_attcoord_points, context="initial_attcoord")
                     _trim_attcoord_grid_to_minimoon_orbit(
                         timer, minimoon, min_points=min_attcoord_points, context="initial_attcoord"
@@ -4764,13 +5099,13 @@ def run_OD(config_global):
                         timer.attcoord_searchtimes_jdtdb,
                         n_body_propagator.propagate_multiple_objects
                     )
-
+                    print("Propogated Priors step 0")
                     sc_eme_states_kms_piecewise, anchor_info = util.piecewise_anchor_and_propagate_spacecraft_trajs(
                         formation=formation, minimoon=minimoon, timer=timer,
                         t_targets_jdtdb=timer.attcoord_searchtimes_jdtdb,
                         n_body_propagator=n_body_propagator, return_anchor_info=True
                     )
-
+                    
                     ast_eme_state_kms = minimoon.curr_state_eme
                     ast_eme_traj_kms = n_body_propagator.propagate(ast_eme_state_kms, timer.curr_epoch,
                                                                    timer.attcoord_searchtimes_jdtdb)
@@ -4794,7 +5129,7 @@ def run_OD(config_global):
                     ast_truth_original_eclip[:, 3:] *= config['AU_TO_M'] / config['KM_TO_M'] / config['SECONDS_PER_DAY']
                     ast_truth_original_eme = util.geo_eclip_to_geo_eme_generic(ast_truth_original_eclip,
                                                                                hint=("time", "state"))
-
+                    print("Piecewise anchors done step 0")
                     # to visualize the possible att coord scenarios
                     viz_prop_flag_ini = False
                     if viz_prop_flag_ini:
@@ -4859,11 +5194,42 @@ def run_OD(config_global):
                         fixed_agent_u_mode="provided",
                         coverage_point=ast_eme_traj_kms[:, :3]
                     )
-
+                    initial_result_feasible = (
+                        getattr(res_kcoverage, "u_cmd", None) is not None
+                        and np.isfinite(float(getattr(res_kcoverage, "chosen_dt", np.nan)))
+                    )
+                    initial_attempt_records = [{
+                        "series": result_kcoverage_series,
+                        "anchor_requested_sid": int(initial_detecting_list[0]),
+                        "anchor_result_feasible": bool(initial_result_feasible),
+                        "anchor_release_reason": "" if initial_result_feasible else "initial_fixed_anchor_horizon_infeasible",
+                    }]
+                    _log_attcoord_attempt_records(
+                        attcoord_csv_path=attcoord_csv_path,
+                        uid=uid,
+                        m_idx=m_idx,
+                        timer=timer,
+                        x_ts=x_ts,
+                        P_ts=P_ts,
+                        sc_states_ts=sc_eme_states_kms_piecewise,
+                        attempt_records=initial_attempt_records,
+                        final_result=res_kcoverage,
+                        final_mode="provided",
+                        final_anchor_sid=int(initial_detecting_list[0]),
+                        phase="initial",
+                        resume_after_step=resume_after_step,
+                    )
+                    print("Finished Att coord Step 0")
                     attcoord_endtime = time.time()
                     timer.set_attcoord_time(attcoord_endtime - attcoord_startime - mean_time)
                     attcoord_time = attcoord_endtime - attcoord_startime - mean_time
                     od_time = 0.0
+
+                    if getattr(res_kcoverage, "u_cmd", None) is None or not np.isfinite(float(getattr(res_kcoverage, "chosen_dt", np.nan))):
+                        raise ValueError(
+                            "Initial attitude coordination found no feasible candidate; "
+                            f"diagnostics written to {attcoord_csv_path}."
+                        )
 
                     timer.set_slew_time(res_kcoverage.chosen_dt)
 
@@ -5091,7 +5457,7 @@ def run_OD(config_global):
                             agent_orbit_tracks_xyz=[sc_eme_states_kms_piecewise[:, i, :3] for i in range(config['num_spacecraft'])]
                         )
 
-                        plot_cost_diagnosis = True
+                        plot_cost_diagnosis = False
                         if plot_cost_diagnosis:
                             util.plot_attcoord_costs_from_series(
                                 result_kcoverage_series,
@@ -6222,6 +6588,25 @@ def run_OD(config_global):
                         od_time=(od_time if measurements_available_for_cycle else None),
                         measurements_available=measurements_available_for_cycle,
                     )
+                    if communication_plan_for_cycle is not None:
+                        comm_outer_summary = communication_plan_for_cycle.outer_summary(
+                            include_measurement=measurements_available_for_cycle,
+                            include_command=True,
+                        )
+                        _append_communications_diagnostics(
+                            communications_csv_path,
+                            communication_plan_for_cycle,
+                            uid=uid,
+                            m_idx=m_idx,
+                            rank=rank,
+                            simulation_run_number=simulation_run_number,
+                            od_step_idx=int(timer.curr_od_index) + 1,
+                            epoch_jdtdb=float(timer.curr_epoch),
+                            include_measurement=measurements_available_for_cycle,
+                            include_command=True,
+                            diagnostics_enabled=communications_model.diagnostics_enabled,
+                            header=communications_header,
+                        )
                     _validate_attcoord_search_grid(timer, min_attcoord_points, context="attcoord")
                     _trim_attcoord_grid_to_minimoon_orbit(
                         timer, minimoon, min_points=min_attcoord_points, context="attcoord"
@@ -6307,6 +6692,8 @@ def run_OD(config_global):
                     chosen_anchor_sid = None
                     chosen_anchor_mode = "none"
                     chosen_anchor_feasible = False
+                    attcoord_attempt_records = []
+                    last_anchor_release_reason = ""
 
                     def _call_attcoord_with_anchor(anchor_sid):
                         use_anchor = anchor_sid is not None
@@ -6342,12 +6729,24 @@ def run_OD(config_global):
                         for anchor_sid_try in anchor_candidates:
                             tmp = _call_attcoord_with_anchor(int(anchor_sid_try))
                             res_try = tmp[0]
-                            if getattr(res_try, "u_cmd", None) is not None and np.isfinite(float(getattr(res_try, "chosen_dt", np.nan))):
+                            anchor_try_feasible = (
+                                getattr(res_try, "u_cmd", None) is not None
+                                and np.isfinite(float(getattr(res_try, "chosen_dt", np.nan)))
+                            )
+                            anchor_release_reason = "" if anchor_try_feasible else "anchored_horizon_infeasible"
+                            attcoord_attempt_records.append({
+                                "series": tmp[2],
+                                "anchor_requested_sid": int(anchor_sid_try),
+                                "anchor_result_feasible": bool(anchor_try_feasible),
+                                "anchor_release_reason": anchor_release_reason,
+                            })
+                            if anchor_try_feasible:
                                 res_kcoverage, result_mean, result_kcoverage_series, result_mean_series, mean_time = tmp
                                 chosen_anchor_sid = int(anchor_sid_try)
                                 chosen_anchor_mode = tracking_anchor_fixed_mode
                                 chosen_anchor_feasible = True
                                 break
+                            last_anchor_release_reason = anchor_release_reason
                             if tracking_anchor_fallback != "next_oldest":
                                 res_kcoverage, result_mean, result_kcoverage_series, result_mean_series, mean_time = tmp
                                 chosen_anchor_sid = int(anchor_sid_try)
@@ -6377,6 +6776,16 @@ def run_OD(config_global):
                             fixed_agent_u_mode="provided",
                             coverage_point=ast_eme_traj_kms[:, :3],
                         )
+                        free_result_feasible = (
+                            getattr(res_kcoverage, "u_cmd", None) is not None
+                            and np.isfinite(float(getattr(res_kcoverage, "chosen_dt", np.nan)))
+                        )
+                        attcoord_attempt_records.append({
+                            "series": result_kcoverage_series,
+                            "anchor_requested_sid": None,
+                            "anchor_result_feasible": bool(free_result_feasible),
+                            "anchor_release_reason": last_anchor_release_reason,
+                        })
                         chosen_anchor_sid = None
                         chosen_anchor_mode = "free"
                         chosen_anchor_feasible = False
@@ -6385,9 +6794,43 @@ def run_OD(config_global):
                     tracking_anchor_mode = chosen_anchor_mode
                     tracking_anchor_feasible = int(bool(chosen_anchor_feasible))
 
+                    if not attcoord_attempt_records:
+                        final_result_feasible = (
+                            getattr(res_kcoverage, "u_cmd", None) is not None
+                            and np.isfinite(float(getattr(res_kcoverage, "chosen_dt", np.nan)))
+                        )
+                        attcoord_attempt_records.append({
+                            "series": result_kcoverage_series,
+                            "anchor_requested_sid": chosen_anchor_sid,
+                            "anchor_result_feasible": bool(final_result_feasible),
+                            "anchor_release_reason": "",
+                        })
+
+                    _log_attcoord_attempt_records(
+                        attcoord_csv_path=attcoord_csv_path,
+                        uid=uid,
+                        m_idx=m_idx,
+                        timer=timer,
+                        x_ts=x_ts,
+                        P_ts=P_ts,
+                        sc_states_ts=sc_eme_states_kms_piecewise,
+                        attempt_records=attcoord_attempt_records,
+                        final_result=res_kcoverage,
+                        final_mode=tracking_anchor_mode,
+                        final_anchor_sid=tracking_anchor_sid,
+                        phase=("reacquisition" if pending_reacquisition else "regular"),
+                        resume_after_step=resume_after_step,
+                    )
+
                     attcoord_endtime = time.time()
                     timer.set_attcoord_time(attcoord_endtime - attcoord_startime - mean_time)
                     attcoord_time = attcoord_endtime - attcoord_startime - mean_time
+
+                    if getattr(res_kcoverage, "u_cmd", None) is None or not np.isfinite(float(getattr(res_kcoverage, "chosen_dt", np.nan))):
+                        raise ValueError(
+                            "Attitude coordination found no feasible candidate; "
+                            f"diagnostics written to {attcoord_csv_path}."
+                        )
 
                     timer.set_slew_time(res_kcoverage.chosen_dt)
 
@@ -6420,49 +6863,7 @@ def run_OD(config_global):
                     chosen_candidate_idx = best_idx
                     chosen_candidate_epoch_jdtdb = best_epoch_jdtdb
 
-                    # detailed attcoord logging
-                    if log_attcoord and timer.curr_od_index > resume_after_step:
-                        for cand_idx in range(len(timer.attcoord_searchtimes_jdtdb)):
-                            row_att = {
-                                "run_uid": uid,
-                                "master_row_idx": m_idx,
-                                "rank": rank,
-                                "od_step_idx": int(timer.curr_od_index),
-                                "candidate_idx": cand_idx,
-                                "candidate_epoch_jdtdb": float(timer.attcoord_searchtimes_jdtdb[cand_idx]),
-                                "is_chosen": int(cand_idx == best_idx),
-                            }
-                            xpred = _flatten_vec(x_ts[cand_idx], 6)
-                            Ppred = _safe_diag(P_ts[cand_idx], 6)
-                            for i in range(6):
-                                row_att[f"x_pred_{i}"] = xpred[i]
-                                row_att[f"P_pred_diag_{i}"] = Ppred[i]
-
-                            sc_cand = np.asarray(sc_eme_states_kms_piecewise[cand_idx], dtype=float)
-                            for sc_id in range(num_sc):
-                                vals = _flatten_vec(sc_cand[sc_id], 6)
-                                for i in range(6):
-                                    row_att[f"sc{sc_id}_state_{i}"] = vals[i]
-
-                            u_cand = None
-                            J_cand = np.nan
-                            coverage_cand = np.nan
-                            if cand_idx < len(result_kcoverage_series):
-                                if isinstance(result_kcoverage_series[cand_idx], dict):
-                                    u_cand = result_kcoverage_series[cand_idx].get("u", None)
-                                    J_cand = _safe_scalar(result_kcoverage_series[cand_idx].get("J", np.nan))
-                                    coverage_cand = _safe_scalar(result_kcoverage_series[cand_idx].get("kcoverage", np.nan))
-                            if u_cand is None:
-                                u_cand = best_attitudes if cand_idx == best_idx else np.full((num_sc, 3), np.nan)
-                            u_cand = np.asarray(u_cand, dtype=float)
-                            for sc_id in range(num_sc):
-                                vals = _flatten_vec(u_cand[sc_id], 3)
-                                for i in range(3):
-                                    row_att[f"u_cmd_sc{sc_id}_{i}"] = vals[i]
-
-                            row_att["J"] = J_cand
-                            row_att["coverage_score"] = coverage_cand
-                            _append_row(attcoord_csv_path, row_att, attcoord_header)
+                    # Candidate/anchor diagnostics are written before applying the selected slew.
 
                     # optimizer logging based on actual history structure
                     if log_optimizer and hasattr(res_kcoverage, "extra") and isinstance(res_kcoverage.extra, dict):
@@ -7087,6 +7488,8 @@ def run_OD(config_global):
                     "chosen_candidate_epoch_jdtdb": chosen_candidate_epoch_jdtdb,
                     "progress_status": progress_status,
                 }
+                if comm_outer_summary:
+                    row_out.update(comm_outer_summary)
 
                 for i in range(6):
                     row_out[f"x_est_{i}"] = x_est[i]

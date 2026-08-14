@@ -105,6 +105,77 @@ def _select_keepout_geometry(p_em, R_em, agent_index, n_agents):
     return np.asarray(center, dtype=float).reshape(3,), radius
 
 
+def _iv_clearance_diagnostics(p_agents, u_agents, p_em, R_em, theta_h, alpha_s):
+    """Return compact per-spacecraft IV clearance diagnostics in degrees.
+
+    The hard keepout test accepts a command when
+        gamma >= alpha_em + theta_h + alpha_s,
+    where gamma is the boresight-to-IV-axis separation and alpha_em is the
+    apparent angular radius of the virtual IV sphere.  The returned arrays
+    report the terms of that inequality without changing feasibility logic.
+    """
+    p_agents = np.asarray(p_agents, dtype=float)
+    M = int(p_agents.shape[0])
+
+    axis_sep_deg = np.full(M, np.nan, dtype=float)
+    required_axis_sep_deg = np.full(M, np.nan, dtype=float)
+    fov_edge_clearance_deg = np.full(M, np.nan, dtype=float)
+    clearance_margin_deg = np.full(M, np.nan, dtype=float)
+
+    if u_agents is None or not _keepout_is_active(p_em, R_em):
+        return (
+            axis_sep_deg,
+            required_axis_sep_deg,
+            fov_edge_clearance_deg,
+            clearance_margin_deg,
+        )
+
+    u_agents = np.asarray(u_agents, dtype=float)
+    if u_agents.shape != (M, 3):
+        return (
+            axis_sep_deg,
+            required_axis_sep_deg,
+            fov_edge_clearance_deg,
+            clearance_margin_deg,
+        )
+
+    for i in range(M):
+        p_em_i, R_em_i = _select_keepout_geometry(p_em, R_em, i, M)
+        if p_em_i is None or not np.isfinite(float(R_em_i)) or float(R_em_i) <= 0.0:
+            continue
+        r = np.asarray(p_em_i, dtype=float).reshape(3,) - p_agents[i]
+        d = float(np.linalg.norm(r))
+        if not np.isfinite(d) or d <= 1.0e-12:
+            continue
+        nu = float(np.linalg.norm(u_agents[i]))
+        if not np.isfinite(nu) or nu <= 1.0e-12:
+            continue
+
+        u_iv = r / d
+        u_b = u_agents[i] / nu
+        gamma = float(np.arccos(np.clip(np.dot(u_b, u_iv), -1.0, 1.0)))
+        if d <= float(R_em_i):
+            alpha_em = 0.5 * np.pi
+        else:
+            alpha_em = float(np.arcsin(np.clip(float(R_em_i) / d, 0.0, 1.0)))
+
+        required = alpha_em + float(theta_h) + float(alpha_s)
+        edge_clearance = gamma - (alpha_em + float(theta_h))
+        margin = gamma - required
+
+        axis_sep_deg[i] = float(np.rad2deg(gamma))
+        required_axis_sep_deg[i] = float(np.rad2deg(required))
+        fov_edge_clearance_deg[i] = float(np.rad2deg(edge_clearance))
+        clearance_margin_deg[i] = float(np.rad2deg(margin))
+
+    return (
+        axis_sep_deg,
+        required_axis_sep_deg,
+        fov_edge_clearance_deg,
+        clearance_margin_deg,
+    )
+
+
 def _dynamic_iv_virtual_spheres(
     p_agents_ts,
     moon_position_ts,
@@ -2688,7 +2759,6 @@ def optimize_pointing_lbfgs_joint(
         n_mc=y_cached.shape[0], y_samples_cached=y_cached,
         coverage_mode=coverage_mode
     )
-
     return u_best, angles_best, float(J_best), history, float(best_cost)
 
 
@@ -2940,6 +3010,7 @@ class AttitudeCoordinator:
                         virtual_distance=self.dynamic_virtual_distance,
                     )
                 )
+            print("Used dynamic IV")
         else:
             # Legacy compatibility path for callers that explicitly supply a
             # sphere while the dynamic EMS switch is disabled.
@@ -2965,6 +3036,7 @@ class AttitudeCoordinator:
             else:
                 p_em_ts = None
                 R_em_ts = None
+            print("Used legacy IV")
 
         # coverage_point may be static or time-varying
         covpt_ts = None
@@ -3056,25 +3128,43 @@ class AttitudeCoordinator:
                 # print(fixed_agent_mode_k)
 
                 if not fixed_agent_feasible_k:
+                    nan_iv = np.full(M, np.nan, dtype=float)
                     opt_series.append(dict(
                         k=k, dt=dt, feasible=False,
+                        failure_stage="fixed_anchor_precheck",
+                        failure_reason=(fixed_agent_infeasible_reason or "fixed_anchor_infeasible"),
                         u=None,
+                        u_pre_iv=None,
                         cost=float("nan"),
                         J=float("nan"),
                         theta_req_avg_deg=float("nan"),
                         theta_s_allowed=float(theta_s_t),
                         coverage=-1,
+                        coverage_mode=None,
+                        n_mean_full_cover=-1,
+                        mean_full_cover_flags=None,
                         history=None,
+                        use_fixed_agent=bool(use_fixed_agent_k),
                         fixed_agent_idx=idx_fix_i,
                         fixed_agent_u_mode=fixed_agent_mode_k,
                         fixed_agent_feasible=False,
                         fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                         fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                        optimizer_returned_solution=False,
+                        optimizer_cost_pre_iv=float("nan"),
+                        optimizer_J_pre_iv=float("nan"),
+                        hard_iv_pass=float("nan"),
                         iv_half_angle_rad=dynamic_iv_half_angle_rad,
                         iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
+                        iv_safe_flags=None,
+                        iv_axis_angle_to_boresight_deg=nan_iv.copy(),
+                        iv_required_axis_sep_deg=nan_iv.copy(),
+                        iv_fov_edge_clearance_deg=nan_iv.copy(),
+                        iv_clearance_margin_deg=nan_iv.copy(),
                     ))
                     continue
 
+            
             u_star, ang_star, J_star, history, cost_star = optimize_pointing_lbfgs_joint(
                 p_hat_k, P_p_k, p_agents_k, u_curr_agents,
                 float(theta_h), theta_s_list_t, self.jitter,
@@ -3103,22 +3193,47 @@ class AttitudeCoordinator:
 
             if u_star is None or not np.isfinite(float(cost_star)):
                 # infeasible / failed
+                coverage_mode_failed = None
+                n_mean_full_cover_failed = -1
+                mean_full_cover_flags_failed = None
+                if history:
+                    coverage_mode_failed = history[0].get("coverage_mode")
+                    n_mean_full_cover_failed = int(history[0].get("n_mean_full_cover", -1))
+                    mean_full_cover_flags_failed = history[0].get("mean_full_cover_flags")
+                nan_iv = np.full(M, np.nan, dtype=float)
+                failure_reason = "optimizer_returned_none" if u_star is None else "optimizer_nonfinite_cost"
                 opt_series.append(dict(
                     k=k, dt=dt, feasible=False,
+                    failure_stage="optimizer",
+                    failure_reason=failure_reason,
                     u=None,
+                    u_pre_iv=None,
                     cost=float("nan"),
                     J=float("nan"),
                     theta_req_avg_deg=float("nan"),
                     theta_s_allowed=float(theta_s_t),
                     coverage=-1,
+                    coverage_mode=coverage_mode_failed,
+                    n_mean_full_cover=n_mean_full_cover_failed,
+                    mean_full_cover_flags=mean_full_cover_flags_failed,
                     history=history,
+                    use_fixed_agent=bool(use_fixed_agent_k),
                     fixed_agent_idx=(None if fixed_agent_idx_k is None else int(fixed_agent_idx_k)),
                     fixed_agent_u_mode=fixed_agent_mode_k,
                     fixed_agent_feasible=bool(fixed_agent_feasible_k),
                     fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                     fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                    optimizer_returned_solution=False,
+                    optimizer_cost_pre_iv=(float(cost_star) if np.isfinite(float(cost_star)) else float("nan")),
+                    optimizer_J_pre_iv=(float(J_star) if J_star is not None and np.isfinite(float(J_star)) else float("nan")),
+                    hard_iv_pass=float("nan"),
                     iv_half_angle_rad=dynamic_iv_half_angle_rad,
                     iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
+                    iv_safe_flags=None,
+                    iv_axis_angle_to_boresight_deg=nan_iv.copy(),
+                    iv_required_axis_sep_deg=nan_iv.copy(),
+                    iv_fov_edge_clearance_deg=nan_iv.copy(),
+                    iv_clearance_margin_deg=nan_iv.copy(),
                 ))
                 continue
 
@@ -3135,24 +3250,55 @@ class AttitudeCoordinator:
                         p_agents_k[i], u_star[i], float(theta_h),
                         p_em_i, R_em_i, float(alpha_s)
                     )
+            (
+                iv_axis_angle_to_boresight_deg,
+                iv_required_axis_sep_deg,
+                iv_fov_edge_clearance_deg,
+                iv_clearance_margin_deg,
+            ) = _iv_clearance_diagnostics(
+                p_agents_k, u_star, p_em_k, R_em_k, float(theta_h), float(alpha_s)
+            )
+
             if not bool(np.all(iv_safe_flags)):
+                coverage_mode_failed = None
+                n_mean_full_cover_failed = -1
+                mean_full_cover_flags_failed = None
+                if history:
+                    coverage_mode_failed = history[0].get("coverage_mode")
+                    n_mean_full_cover_failed = int(history[0].get("n_mean_full_cover", -1))
+                    mean_full_cover_flags_failed = history[0].get("mean_full_cover_flags")
                 opt_series.append(dict(
                     k=k, dt=dt, feasible=False,
+                    failure_stage="hard_iv_check",
+                    failure_reason="optimized_iv_infeasible",
                     u=None,
+                    u_pre_iv=u_star.copy(),
                     cost=float("nan"),
                     J=float("nan"),
                     theta_req_avg_deg=float("nan"),
                     theta_s_allowed=float(theta_s_t),
                     coverage=-1,
+                    coverage_mode=coverage_mode_failed,
+                    n_mean_full_cover=n_mean_full_cover_failed,
+                    mean_full_cover_flags=mean_full_cover_flags_failed,
                     history=history,
+                    use_fixed_agent=bool(use_fixed_agent_k),
                     fixed_agent_idx=(None if fixed_agent_idx_k is None else int(fixed_agent_idx_k)),
                     fixed_agent_u_mode=fixed_agent_mode_k,
                     fixed_agent_feasible=bool(fixed_agent_feasible_k),
-                    fixed_agent_infeasible_reason="optimized_iv_infeasible",
+                    fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                     fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                    optimizer_returned_solution=True,
+                    optimizer_cost_pre_iv=float(cost_star),
+                    optimizer_J_pre_iv=float(J_star),
+                    hard_iv_pass=False,
                     iv_half_angle_rad=dynamic_iv_half_angle_rad,
                     iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
                     iv_safe_flags=iv_safe_flags.copy(),
+                    iv_axis_angle_to_boresight_deg=iv_axis_angle_to_boresight_deg.copy(),
+                    iv_required_axis_sep_deg=iv_required_axis_sep_deg.copy(),
+                    iv_fov_edge_clearance_deg=iv_fov_edge_clearance_deg.copy(),
+                    iv_clearance_margin_deg=iv_clearance_margin_deg.copy(),
                 ))
                 continue
 
@@ -3176,7 +3322,10 @@ class AttitudeCoordinator:
 
             row = dict(
                 k=k, dt=dt, feasible=True,
+                failure_stage="none",
+                failure_reason="feasible",
                 u=u_star,
+                u_pre_iv=u_star.copy(),
                 cost=c,
                 J=Jv,
                 theta_req_avg_deg=slew_avg_deg,
@@ -3186,14 +3335,23 @@ class AttitudeCoordinator:
                 n_mean_full_cover=n_mean_full_cover,
                 mean_full_cover_flags=mean_full_cover_flags,
                 history=history,
+                use_fixed_agent=bool(use_fixed_agent_k),
                 fixed_agent_idx=(None if fixed_agent_idx_k is None else int(fixed_agent_idx_k)),
                 fixed_agent_u_mode=fixed_agent_mode_k,
                 fixed_agent_feasible=bool(fixed_agent_feasible_k),
                 fixed_agent_infeasible_reason=fixed_agent_infeasible_reason,
                 fixed_agent_theta_req_deg=float(np.rad2deg(fixed_agent_theta_req_rad)) if np.isfinite(fixed_agent_theta_req_rad) else float("nan"),
+                optimizer_returned_solution=True,
+                optimizer_cost_pre_iv=float(cost_star),
+                optimizer_J_pre_iv=float(J_star),
+                hard_iv_pass=True,
                 iv_half_angle_rad=dynamic_iv_half_angle_rad,
                 iv_axes=(None if dynamic_iv_axes_ts is None else dynamic_iv_axes_ts[k].copy()),
                 iv_safe_flags=iv_safe_flags.copy(),
+                iv_axis_angle_to_boresight_deg=iv_axis_angle_to_boresight_deg.copy(),
+                iv_required_axis_sep_deg=iv_required_axis_sep_deg.copy(),
+                iv_fov_edge_clearance_deg=iv_fov_edge_clearance_deg.copy(),
+                iv_clearance_margin_deg=iv_clearance_margin_deg.copy(),
             )
             opt_series.append(row)
 
@@ -3232,7 +3390,7 @@ class AttitudeCoordinator:
                     "fixed_agent_theta_req_deg": best_opt.get("fixed_agent_theta_req_deg"),
                 },
             )
-
+        print("Finished all epochs")
         # ============================================================
         # (B) MEAN per-epoch diagnostics + earliest-feasible selection
         # ============================================================
@@ -3240,7 +3398,7 @@ class AttitudeCoordinator:
 
         mean_series: List[Dict[str, Any]] = []
         best_mean = None
-
+        print("Started Mean Method")
         for k, dt in enumerate(dt_grid):
             dt = float(dt)
             p_agents_k = p_agents_ts[k]
@@ -3308,7 +3466,7 @@ class AttitudeCoordinator:
             )
 
         mean_time = time.time() - start_mean
-
+        print("Finished mean method, finished step")
         return res_opt_best, res_mean_best, opt_series, mean_series, mean_time
 
 
