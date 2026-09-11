@@ -8,7 +8,7 @@ from pathlib import Path
 # USER SETTINGS
 # ============================================================
 
-CSV_FILE = Path(r"to_sync/results_sc_trade/results_5_fov/MASTER_IOD.csv")
+CSV_FILE = Path(r"to_sync\to_sync\phase_results\copy_5_10\MASTER_IOD.csv")
 
 # Sliding-window settings, in days
 WINDOW_LENGTH_DAYS = 365.25 * 5 - 270
@@ -284,7 +284,7 @@ if MAKE_PLOT:
         marker="o",
         markersize=3,
         linewidth=1,
-        label="Converged scenarios",
+        label="Identified TBOs",
     )
 
     # Mean
@@ -312,8 +312,8 @@ if MAKE_PLOT:
     )
 
     ax.set_ylabel(
-        f"Converged scenarios within "
-        f"{WINDOW_LENGTH_DAYS:g} days"
+        f"Identified TBOs within nominal operations "
+        f"({WINDOW_LENGTH_DAYS:g} days)"
     )
 
     ax.grid(alpha=0.25)

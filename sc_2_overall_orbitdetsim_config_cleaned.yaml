@@ -8,7 +8,7 @@ spice:
   kernels:
   - naif0012.tls
   - de430.bsp
-num_spacecraft: 2
+num_spacecraft: 4
 ADD_NOISE: 1
 INCLUDE_EMS_EXCLUSION: 1
 run_IOD_hyperparameter: false
@@ -31,7 +31,7 @@ mission_summary:
 
 formation_phasing:
   mode: "custom"
-  relative_phase_deg: [0.0, 30.0]
+  relative_phase_deg: [0.0, 5.0, 10.0, 15.0]
 
 ###################################
 # paths & file names
@@ -205,7 +205,7 @@ initial_boresight_packing:
   packing_search_step_deg: 0.01
 
   # Maximum permitted outward displacement from the nominal boresight.
-  max_outward_offset_deg: 15.0
+  max_outward_offset_deg: 55.0
 
 #####################################################
 # Asteroid parameters
